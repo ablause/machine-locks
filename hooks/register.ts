@@ -40,7 +40,7 @@ const SWEEP_KEY = 'sweepAt'
 const ALERTED_KEY = 'alerted'
 
 const DESCRIPTION = `Exclusive resources shared by every Claude session on this machine (a simulator or device, a local database, fixed ports, build capacity), so two sessions never use one at once.
-Actions: "list" (every resource with its capacity, holders and queue); "define" (resource, capacity; add memoryGb and/or cores, what one slot uses, and capacity becomes the max: the capacity then follows the machine's free memory and load); "acquire" (resource, label: answers granted, or queued with how many are ahead; when queued, do not touch the resource and end your turn on "Waiting on <resource>": a GRANTED <resource> message wakes you once a slot frees); "release" (resource, label: frees your slot as soon as you are done, and the next session in line is told); "remove" (resource, refused while another session holds or waits on it).
+Actions: "list" (every resource with its capacity, holders and queue); "define" (resource, capacity; add memoryGb and/or cores, what one slot uses, and capacity becomes the max: the capacity then follows the machine's free memory and load); "acquire" (resource, label: answers granted, or queued with how many are ahead; when queued, do not touch the resource and end your turn on "Waiting on <resource> for <label>": a GRANTED <resource> message wakes you once a slot frees); "release" (resource, label: frees your slot as soon as you are done, and the next session in line is told); "remove" (resource, refused while another session holds or waits on it).
 "label" says what the slot is for, your task id in a coordinator run; a second slot of the same resource takes another label (T2#2). Every slot of this session is freed when it exits.`
 
 async function loadLocks(o: Ops): Promise<Locks> {
@@ -224,7 +224,7 @@ async function acquire(o: Ops, resource: string, label: string): Promise<string>
   const { outcome, ahead } = await changeLocks(o, all => acquireIn(all, resource, holder))
   if (outcome === 'unknown') return `${resource} is not defined: "list" shows the resources, "define" adds one`
   if (outcome === 'granted') return `${resource} granted: it is yours until you release it`
-  return `${resource} queued, ${ahead} ahead: do not use it yet, end your turn on "Waiting on ${resource}"; a GRANTED ${resource} message wakes you`
+  return `${resource} queued, ${ahead} ahead: do not use it yet, end your turn on "Waiting on ${resource}${label ? ` for ${label}` : ''}"; a GRANTED ${resource} message wakes you`
 }
 
 /** Another session's slot is freed only once that session is gone: a live one is asked to release it itself. */
