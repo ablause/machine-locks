@@ -1,0 +1,132 @@
+import type { On } from 'claude-code'
+import { expect, mock, test } from 'claude-code/testing'
+import type { Engine } from 'claude-code/testing'
+
+const TOOL = 'mcp__machine-locks__locks'
+
+/** Two sessions of one machine: they share the store, and `as` switches which one is calling. */
+function machine(on: On, live: string[] = ['a', 'b', 'c'], sysctl?: { stdout: string; pressure: string }) {
+  const store = new Map<string, unknown>()
+  on('store.get', (_$, e) => ({ value: store.get(e.key) }))
+  on('store.set', (_$, e) => {
+    store.set(e.key, e.value)
+    return { value: undefined }
+  })
+  const clock = mock.clock(on, { now: 1_000_000 })
+  let me = 'a'
+  on('session.id', () => ({ value: me }))
+  on('session.cwd', () => ({ value: `/w/${me}` }))
+  on('session.start', (_$, e) => ({ cwd: e.cwd }))
+  on('tool.register', (_$, e) => ({ value: { tool: e.name } }))
+  on('ui.log', () => ({ value: undefined }))
+  on('session.end', (_$, e) => ({ sessionId: e.sessionId }))
+  const sent: { to: string; text: string }[] = []
+  const unreachable = new Set<string>()
+  on('session.send', (_$, e) => {
+    sent.push({ to: JSON.stringify(e.to), text: e.text })
+    return [...unreachable].some(s => JSON.stringify(e.to).includes(s)) ? { isDelivered: false as const, reason: 'gone' } : { isDelivered: true as const }
+  })
+  const prompts: string[] = []
+  on('prompt.submit', (_$, e) => {
+    prompts.push(e.text)
+    return { text: e.text }
+  })
+  on('process.run', (_$, e) => {
+    const rows = live.map(s => ({ sessionId: s, name: `session-${s}`, state: 'working' }))
+    const stdout = e.argv[0] === 'claude' ? JSON.stringify(rows) : e.argv[0] === 'sysctl' ? (sysctl?.stdout ?? '') : (sysctl?.pressure ?? '')
+    return { value: { exitCode: 0, stdout, stderr: '', isStdoutTruncated: false, isStderrTruncated: false } }
+  })
+  return { store, clock, sent, prompts, unreachable, as: (session: string) => void (me = session) }
+}
+
+const call = async ($: Engine, input: Record<string, unknown>) =>
+  String(((await $.tool.call({ tool: TOOL, ...input } as never)) as { result?: unknown }).result)
+
+test('the second session waits, and is told GRANTED when the first releases', async ($, on) => {
+  const m = machine(on)
+  await $.session.start({ cwd: '/w/a', surface: null, isInteractive: false })
+  expect(await call($, { action: 'define', resource: 'simulator', capacity: 1 })).toBe('simulator defined, capacity 1')
+  expect(await call($, { action: 'acquire', resource: 'simulator', label: 'T1' })).toContain('simulator granted')
+  m.as('b')
+  expect(await call($, { action: 'acquire', resource: 'simulator' })).toContain('queued, 0 ahead')
+  m.as('a')
+  expect(await call($, { action: 'release', resource: 'simulator' })).toBe('simulator released, granted to session-b')
+  expect(m.sent).toHaveLength(1)
+  expect(m.sent[0]?.to).toContain('b')
+  expect(m.sent[0]?.text).toStartWith('GRANTED simulator:')
+})
+
+test('a GRANTED that reaches nobody passes the slot to the next in line', async ($, on) => {
+  const m = machine(on)
+  await $.session.start({ cwd: '/w/a', surface: null, isInteractive: false })
+  await call($, { action: 'define', resource: 'simulator', capacity: 1 })
+  await call($, { action: 'acquire', resource: 'simulator' })
+  m.as('b')
+  await call($, { action: 'acquire', resource: 'simulator' })
+  m.as('c')
+  await call($, { action: 'acquire', resource: 'simulator' })
+  m.unreachable.add('"b"')
+  m.as('a')
+  expect(await call($, { action: 'release', resource: 'simulator' })).toBe('simulator released, granted to session-c')
+  const table = m.store.get('locks') as Record<string, { holders: { session: string }[]; queue: unknown[] }>
+  expect(table.simulator?.holders.map(h => h.session)).toEqual(['c'])
+  expect(table.simulator?.queue).toEqual([])
+})
+
+test('another live session keeps its slot; a gone one can be freed by name', async ($, on) => {
+  const m = machine(on, ['a', 'b'])
+  await $.session.start({ cwd: '/w/a', surface: null, isInteractive: false })
+  await call($, { action: 'define', resource: 'db', capacity: 1 })
+  m.as('b')
+  await call($, { action: 'acquire', resource: 'db' })
+  m.as('a')
+  expect(await call($, { action: 'release', resource: 'db', holder: 'session-b' })).toContain('still running')
+  m.as('c')
+  await call($, { action: 'acquire', resource: 'db' })
+  m.as('a')
+  m.store.set('locks', { db: { capacity: 1, holders: [{ session: 'gone', name: 'old' }], queue: [] } })
+  expect(await call($, { action: 'release', resource: 'db', holder: 'old' })).toBe('db released')
+})
+
+test('a session that exits frees its slots and the next in line is told', async ($, on) => {
+  const m = machine(on)
+  await $.session.start({ cwd: '/w/a', surface: null, isInteractive: false })
+  await call($, { action: 'define', resource: 'simulator', capacity: 1 })
+  await call($, { action: 'acquire', resource: 'simulator' })
+  m.as('b')
+  await call($, { action: 'acquire', resource: 'simulator' })
+  m.as('a')
+  await $.session.end({ reason: 'prompt_input_exit', sessionId: 'a' } as never)
+  expect(m.sent.map(s => s.text.split(':')[0])).toEqual(['GRANTED simulator'])
+})
+
+test('a paused background session keeps its slots', async ($, on) => {
+  const m = machine(on)
+  await $.session.start({ cwd: '/w/a', surface: null, isInteractive: false })
+  await call($, { action: 'define', resource: 'simulator', capacity: 1 })
+  await call($, { action: 'acquire', resource: 'simulator' })
+  await $.session.end({ reason: 'other', sessionId: 'a' } as never)
+  const table = m.store.get('locks') as Record<string, { holders: unknown[] }>
+  expect(table.simulator?.holders).toHaveLength(1)
+})
+
+test('the sweep frees a dead holder someone waits on, and warns a long holder once', async ($, on) => {
+  const m = machine(on, ['a', 'b'])
+  await $.session.start({ cwd: '/w/a', surface: null, isInteractive: false })
+  m.store.set('locks', {
+    simulator: { capacity: 1, holders: [{ session: 'dead', name: 'old', since: 0 }], queue: [{ session: 'b', name: 'session-b' }] },
+    build: { capacity: 1, holders: [{ session: 'a', name: 'session-a', since: 1_000_000 }], queue: [] },
+  })
+  await m.clock.advance(3 * 60_000)
+  expect(m.sent.map(s => s.text.split(':')[0])).toEqual(['GRANTED simulator'])
+  await m.clock.advance(45 * 60_000)
+  expect(m.prompts.filter(p => p.startsWith('[machine-locks] This session has held'))).toHaveLength(1)
+  await m.clock.advance(3 * 60_000)
+  expect(m.prompts.filter(p => p.startsWith('[machine-locks] This session has held'))).toHaveLength(1)
+})
+
+test('a scaled lock is sized from the machine at define', async ($, on) => {
+  machine(on, ['a'], { stdout: '{ 1.00 1.00 1.00 }\n10\n34359738368\n', pressure: 'System-wide memory free percentage: 50%' })
+  await $.session.start({ cwd: '/w/a', surface: null, isInteractive: false })
+  expect(await call($, { action: 'define', resource: 'simulator', capacity: 4, memoryGb: 4 })).toBe('simulator defined, scaled: capacity 2 of max 4')
+})

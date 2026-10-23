@@ -1,0 +1,30 @@
+/** A session holding or waiting on one slot. `label` tells two slots of one session apart (`T2#2`) and says what it is for. */
+export type MachineLocksHolder = { session: string; name: string; label?: string; since?: number }
+
+/** What one slot of a scaled lock costs the machine; its capacity then follows what is left, up to `max`. */
+export type MachineLocksScale = { max: number; memoryMb?: number; cores?: number }
+
+export type MachineLocksLock = { capacity: number; holders: MachineLocksHolder[]; queue: MachineLocksHolder[]; scale?: MachineLocksScale }
+
+export type MachineLocksTable = Record<string, MachineLocksLock>
+
+/** The slots freed on one resource, held or queued, and the sessions that were granted them and told so. */
+export type MachineLocksRelease = { resource: string; released: MachineLocksHolder[]; granted: MachineLocksHolder[] }
+
+/**
+ * The machine-wide lock table, for other mods: every call reads the table as every session on the machine shares it.
+ * A promoted session is told GRANTED directly; one that cannot be reached is dropped and the next one is tried.
+ */
+export type MachineLocks = {
+  list: () => Promise<MachineLocksTable>
+  /** Frees the slots (held or queued) of `session` on `resource`, only the one labelled `label` when given. */
+  release: (resource: string, session: string, label?: string) => Promise<MachineLocksRelease[]>
+  /** Frees every slot `session` holds or waits for, on every resource. */
+  releaseSession: (session: string) => Promise<MachineLocksRelease[]>
+}
+
+declare module 'claude-code' {
+  interface EngineInterface {
+    machineLocks: MachineLocks
+  }
+}
