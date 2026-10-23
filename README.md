@@ -21,8 +21,10 @@ freed by the sweep as soon as someone waits on its lock, and a GRANTED that reac
 on. A session that has held a slot for 45 minutes is asked, once per hold, whether it still needs it.
 
 Other mods use the table through `$.machineLocks` (`list`, `release`, `releaseSession`), typed by
-`types/index.d.ts`, after listing `machine-locks` under `dependencies` in their `plugin.json`: run-board
-draws the table on its board and frees a task's slots when the task merges or its worker is gone.
+`types/index.d.ts`: run-board draws the table on its board and frees a task's slots when the task merges
+or its worker is gone. It does not list `machine-locks` under `dependencies`, because a plugin whose
+dependency is missing does not load at all: a session started without this mod keeps its board, with no
+locks on it.
 
 The mod loads from `CLAUDE_CODE_PLUGIN_DIRS` in `~/.claude/settings.json`, with `~/.claude/mods/machine-locks`
 at its end.
