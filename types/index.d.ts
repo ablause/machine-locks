@@ -7,7 +7,7 @@ export type MachineLocksHolder = { session: string; name: string; label?: string
 /** One slot from its grant to its release, kept to size capacities on what the machine went through. */
 export type MachineLocksHold = { resource: string; name: string; label?: string; releasedAt: number; heldMs: number; waitedMs: number }
 
-/** What one slot of a scaled lock costs the machine; its capacity then follows what is left, up to `max`. */
+/** What one slot of a budgeted lock costs the machine: every budgeted lock draws on the same memory and cores, up to `max` slots of its own. */
 export type MachineLocksScale = { max: number; memoryMb?: number; cores?: number }
 
 /**

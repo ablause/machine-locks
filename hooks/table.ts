@@ -9,11 +9,12 @@ const isSame = (a: Slot, b: Slot) => a.session === b.session && (a.label ?? '') 
 // A release without a label frees every slot of the session on that resource.
 const isMatch = (h: Holder, slot: Slot) => h.session === slot.session && (slot.label === undefined || (h.label ?? '') === slot.label)
 
+// A budgeted lock only queues here: admitIn grants it against the whole machine, in the order every session asked.
 export function acquireIn(all: Locks, resource: string, holder: Holder): { next: Locks; outcome: 'granted' | 'queued' | 'unknown'; ahead: number } {
   const lock = all[resource]
   if (!lock) return { next: all, outcome: 'unknown', ahead: 0 }
   if (lock.holders.some(h => isSame(h, holder))) return { next: all, outcome: 'granted', ahead: 0 }
-  if (lock.holders.length < lock.capacity) {
+  if (!lock.scale && lock.holders.length < lock.capacity) {
     const updated: Lock = { ...lock, holders: [...lock.holders, holder], queue: lock.queue.filter(q => !isSame(q, holder)) }
     return { next: { ...all, [resource]: updated }, outcome: 'granted', ahead: 0 }
   }
@@ -22,8 +23,9 @@ export function acquireIn(all: Locks, resource: string, holder: Holder): { next:
   return { next: { ...all, [resource]: { ...lock, queue: [...lock.queue, holder] } }, outcome: 'queued', ahead: lock.queue.length }
 }
 
-/** Fills the free slots from the queue, in order; a promoted holder starts its hold now, not when it queued. */
+/** Fills the free slots from the queue, in order; a promoted holder starts its hold now, not when it queued. A budgeted lock is left to admitIn. */
 function fill(lock: Lock, now: number): { lock: Lock; promoted: Holder[] } {
+  if (lock.scale) return { lock, promoted: [] }
   const room = Math.max(0, lock.capacity - lock.holders.length)
   const promoted = lock.queue.slice(0, room).map(h => ({ ...h, since: now, waitedMs: h.since === undefined ? 0 : now - h.since }))
   return { lock: { ...lock, holders: [...lock.holders, ...promoted], queue: lock.queue.slice(promoted.length) }, promoted }
@@ -105,25 +107,51 @@ export const WARMUP_MS = 3 * 60_000
 /** The share of memory always left free: below it macOS compresses and swaps, and kills devices and servers at random. */
 export const MEMORY_FLOOR = 0.2
 
+/** What the machine can still give budgeted slots: memory above the floor and idle cores. */
+export type Room = { memoryMb: number; cores: number }
+
+const sum = (values: readonly number[]) => values.reduce((total, v) => total + v, 0)
+
 /**
- * What a scaled lock holds plus what the machine still has room for, between 1 and its max. It rises on every whole
- * slot of room and falls only once it is more than half a slot short, inside the memory floor, so one sweep never
- * undoes the last. A lower capacity never evicts a holder: it only stops granting.
+ * The machine's room less every budgeted slot, whatever its resource, granted too recently for its device to be in
+ * the measure yet: an iOS simulator still booting counts against the Android emulator asked for next.
  */
-export function scaledCapacityOf(lock: Lock, budget: Budget, now: number): number {
-  const { scale } = lock
-  if (!scale) return lock.capacity
-  const warming = lock.holders.filter(h => h.since !== undefined && now - h.since < WARMUP_MS).length
-  const rooms = [
-    ...(scale.memoryMb ? [(budget.freeMb - budget.totalMb * MEMORY_FLOOR) / scale.memoryMb - warming] : []),
-    ...(scale.cores ? [(budget.cores - budget.load) / scale.cores - warming] : []),
-  ]
-  if (rooms.length === 0) return scale.max
-  const room = Math.min(...rooms)
-  const higher = lock.holders.length + Math.floor(room)
-  const lower = lock.holders.length + Math.floor(room + 0.5)
-  const next = higher > lock.capacity ? higher : Math.min(lower, lock.capacity)
-  return Math.min(scale.max, Math.max(1, next))
+export function roomOf(all: Locks, budget: Budget, now: number): Room {
+  const warming = Object.values(all).flatMap(l => (l.scale ? l.holders.filter(h => h.since !== undefined && now - h.since < WARMUP_MS).map(() => l.scale as LockScale) : []))
+  return {
+    memoryMb: budget.freeMb - budget.totalMb * MEMORY_FLOOR - sum(warming.map(s => s.memoryMb ?? 0)),
+    cores: budget.cores - budget.load - sum(warming.map(s => s.cores ?? 0)),
+  }
+}
+
+const fits = (scale: LockScale, room: Room) => (scale.memoryMb ?? 0) <= room.memoryMb && (scale.cores ?? 0) <= room.cores
+
+/** Every session waiting on a budgeted lock, whatever its resource, in the order it asked. */
+export const budgetQueueOf = (all: Locks): { resource: string; holder: Holder }[] =>
+  Object.entries(all)
+    .flatMap(([resource, lock]) => (lock.scale ? lock.queue.map(holder => ({ resource, holder })) : []))
+    .sort((x, y) => (x.holder.since ?? 0) - (y.holder.since ?? 0))
+
+/**
+ * Grants the budgeted waiters in the order they asked, across resources, while the machine's room covers each one.
+ * The first that does not fit stops the line, so a costly slot is never passed forever by cheaper ones; one whose
+ * lock is at its max waits on that lock, not on the machine, and is passed. Without a measure, only the max counts.
+ */
+export function admitIn(all: Locks, room: Room | null, now: number): { next: Locks; promoted: { resource: string; holder: Holder }[] } {
+  let next = all
+  let left = room
+  const promoted: { resource: string; holder: Holder }[] = []
+  for (const { resource, holder } of budgetQueueOf(all)) {
+    const lock = next[resource] as Lock
+    const scale = lock.scale as LockScale
+    if (lock.holders.length >= scale.max) continue
+    if (left && !fits(scale, left)) break
+    if (left) left = { memoryMb: left.memoryMb - (scale.memoryMb ?? 0), cores: left.cores - (scale.cores ?? 0) }
+    const granted = { ...holder, since: now, waitedMs: holder.since === undefined ? 0 : now - holder.since }
+    next = { ...next, [resource]: { ...lock, capacity: scale.max, holders: [...lock.holders, granted], queue: lock.queue.filter(q => !isSame(q, holder)) } }
+    promoted.push({ resource, holder: granted })
+  }
+  return { next, promoted }
 }
 
 /** `sysctl -n vm.loadavg hw.ncpu hw.memsize` and `memory_pressure -Q`, read as what the machine has left. */

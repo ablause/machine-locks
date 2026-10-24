@@ -152,10 +152,19 @@ test('the sweep frees a dead holder someone waits on, and warns a long holder on
   expect(m.prompts.filter(p => p.startsWith('[machine-locks] This session has held'))).toHaveLength(1)
 })
 
-test('a scaled lock is sized from the machine at define', async ($, on) => {
-  machine(on, ['a'], { stdout: '{ 1.00 1.00 1.00 }\n10\n34359738368\n', pressure: 'System-wide memory free percentage: 50%' })
+test('iOS and Android share the machine: the third device waits until the first two have booted', async ($, on) => {
+  const m = machine(on, ['a', 'b', 'c'], { stdout: '{ 1.00 1.00 1.00 }\n10\n34359738368\n', pressure: 'System-wide memory free percentage: 50%' })
   await $.session.start({ cwd: '/w/a', surface: null, isInteractive: false })
-  expect(await call($, { action: 'define', resource: 'simulator', capacity: 4, memoryGb: 4 })).toBe('simulator defined, scaled: capacity 2 of max 4')
+  expect(await call($, { action: 'define', resource: 'ios-simulator', capacity: 6, memoryGb: 4 })).toContain('up to 6 slots of 4 GB each')
+  await call($, { action: 'define', resource: 'android-emulator', capacity: 4, memoryGb: 4 })
+  expect(await call($, { action: 'acquire', resource: 'ios-simulator' })).toContain('granted')
+  m.as('b')
+  expect(await call($, { action: 'acquire', resource: 'android-emulator' })).toContain('granted')
+  m.as('c')
+  expect(await call($, { action: 'acquire', resource: 'ios-simulator' })).toContain('queued, 0 ahead')
+  m.as('a')
+  await m.clock.advance(3 * 60_000 + 30_000)
+  expect(m.sent.map(s => [s.to, s.text.split(':')[0]])).toEqual([['"c"', 'GRANTED ios-simulator']])
 })
 
 test('every change of the table holds the machine mutex and frees it', async ($, on) => {

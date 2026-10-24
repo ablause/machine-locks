@@ -7,11 +7,16 @@ instead of colliding.
 
 Every session gets the `mcp__machine-locks__locks` tool:
 
-- `define` a resource with its capacity; with `memoryGb` and/or `cores` (what one slot uses) the capacity
-  becomes a maximum, and every three minutes one session sets it from the machine's free memory and load,
-  always leaving a fifth of the memory free;
+- `define` a resource with its capacity. With `memoryGb` and/or `cores`, what one slot uses, the resource is
+  budgeted: its capacity becomes its own maximum, and its slots are granted from the machine's free memory and
+  idle cores, which every budgeted resource shares. Six iOS simulators or two simulators and two emulators: the
+  machine decides, not a count per kind. A fifth of the memory always stays free, and a slot granted less than
+  three minutes ago counts as used until its device has booted, whatever its kind;
 - `acquire` answers granted, or queued with how many are ahead. A queued session stops there: when a slot
-  frees, the session that frees it sends it `GRANTED <resource>` directly, which wakes it;
+  frees, the session that frees it sends it `GRANTED <resource>` directly, which wakes it. Budgeted resources
+  share one line, served in the order sessions asked: the first that does not fit holds the others back, so an
+  emulator is never passed forever by cheaper simulators. Memory frees as a device shuts down rather than at its
+  release, so the line is checked again every thirty seconds while someone waits;
 - `release` frees the slot and tells the next in line; `list` and `remove` do what they say;
 - `history` gives, per resource, how many holds, how many queued first, and the median and 90th percentile wait
   and hold in minutes, over the last 500 slots released: what to set a capacity or `memoryGb` from.

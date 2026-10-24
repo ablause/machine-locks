@@ -1,6 +1,6 @@
 import type { EngineInterface, Register } from 'claude-code'
 import type { MachineLocks, MachineLocksGuard as Guard, MachineLocksHold as Hold, MachineLocksHolder as Holder, MachineLocksRelease as Release, MachineLocksTable as Locks } from '../types'
-import { acquireIn, budgetOf, deadHoldersOf, defineIn, guardVerdictOf, historyStatsOf, historyWith, liveSessionsOf, LOCKS_KEY, longHeldOf, nameOf, releaseIn, removeIn, scaledCapacityOf } from './table'
+import { acquireIn, admitIn, budgetOf, budgetQueueOf, deadHoldersOf, defineIn, guardVerdictOf, historyStatsOf, historyWith, liveSessionsOf, LOCKS_KEY, longHeldOf, nameOf, releaseIn, removeIn, roomOf } from './table'
 import type { AgentRow, Budget } from './table'
 
 type Run = { exitCode: number; stdout: string }
@@ -41,11 +41,14 @@ const TOOL = 'locks'
 const TOOL_ID = 'mcp__machine-locks__locks'
 const SWEEP_MS = 3 * 60_000
 const SWEEP_KEY = 'sweepAt'
+/** How often a waiter on the machine's budget is checked again: memory frees as a device shuts down, not at its release. */
+const ADMIT_MS = 30_000
+const ADMIT_KEY = 'admitAt'
 const ALERTED_KEY = 'alerted'
 const HISTORY_KEY = 'history'
 
 const DESCRIPTION = `Exclusive resources shared by every Claude session on this machine (a simulator or device, a local database, fixed ports, build capacity), so two sessions never use one at once.
-Actions: "list" (every resource with its capacity, holders and queue); "history" (per resource, how often a slot was queued for and how long slots waited and were held: what to size a capacity or memoryGb on); "define" (resource, capacity; add memoryGb and/or cores, what one slot uses, and capacity becomes the max: the capacity then follows the machine's free memory and load; add guard to have Bash refuse the commands that need a slot of it, or that act on every session's instance at once); "acquire" (resource, label: answers granted, or queued with how many are ahead; when queued, do not touch the resource and end your turn on "Waiting on <resource> for <label>": a GRANTED <resource> message wakes you once a slot frees); "release" (resource, label: frees your slot as soon as you are done, and the next session in line is told); "remove" (resource, refused while another session holds or waits on it).
+Actions: "list" (every resource with its capacity, holders and queue); "history" (per resource, how often a slot was queued for and how long slots waited and were held: what to size a capacity or memoryGb on); "define" (resource, capacity; add memoryGb and/or cores, what one slot uses, and the resource draws on the machine's memory and cores, shared with every other resource defined so, capacity becoming its own max; add guard to have Bash refuse the commands that need a slot of it, or that act on every session's instance at once); "acquire" (resource, label: answers granted, or queued with how many are ahead; when queued, do not touch the resource and end your turn on "Waiting on <resource> for <label>": a GRANTED <resource> message wakes you once a slot frees); "release" (resource, label: frees your slot as soon as you are done, and the next session in line is told); "remove" (resource, refused while another session holds or waits on it).
 "label" says what the slot is for, your task id in a coordinator run; a second slot of the same resource takes another label (T2#2). Every slot of this session is freed when it exits.`
 
 async function loadLocks(o: Ops): Promise<Locks> {
@@ -165,7 +168,26 @@ async function release(o: Ops, resource: string, slot: { session: string; label?
   const now = await o.now()
   const { released, promoted, holds } = await changeLocks(o, all => releaseIn(all, resource, slot, now))
   await record(o, holds)
-  return released.length === 0 ? [] : [{ resource, released, granted: await grant(o, resource, promoted) }]
+  if (released.length === 0) return []
+  return [{ resource, released, granted: [...(await grant(o, resource, promoted)), ...(await admit(o))] }]
+}
+
+/** Grants every budgeted waiter the machine has room for now, across resources, and tells each. */
+async function admit(o: Ops, self?: Holder): Promise<Holder[]> {
+  if (budgetQueueOf(await loadLocks(o)).length === 0) return []
+  const budget = await machineBudget(o)
+  const now = await o.now()
+  const { promoted } = await changeLocks(o, all => admitIn(all, budget ? roomOf(all, budget, now) : null, now))
+  const granted: Holder[] = []
+  let isLost = false
+  for (const { resource, holder } of promoted) {
+    if (self && holder.session === self.session && (holder.label ?? '') === (self.label ?? '')) continue
+    const told = await grant(o, resource, [holder])
+    granted.push(...told)
+    if (told.length === 0) isLost = true
+  }
+  // A grant that reached nobody freed its slot without promoting anyone: the machine's room goes to the next in line.
+  return isLost ? [...granted, ...(await admit(o, self))] : granted
 }
 
 async function releaseSession(o: Ops, session: string): Promise<Release[]> {
@@ -184,34 +206,10 @@ const apiOf = (o: Ops): MachineLocks => ({
 })
 
 async function machineBudget(o: Ops): Promise<Budget | null> {
-  const sys = await o.run(['sysctl', '-n', 'vm.loadavg', 'hw.ncpu', 'hw.memsize'], 5000)
-  const pressure = await o.run(['memory_pressure', '-Q'], 5000)
-  if (sys.exitCode !== 0 || pressure.exitCode !== 0) return null
+  const sys = await runOrNull(o, ['sysctl', '-n', 'vm.loadavg', 'hw.ncpu', 'hw.memsize'])
+  const pressure = await runOrNull(o, ['memory_pressure', '-Q'])
+  if (sys?.exitCode !== 0 || pressure?.exitCode !== 0) return null
   return budgetOf(sys.stdout, pressure.stdout)
-}
-
-/** Sets every scaled lock to what the machine has room for now, and grants the queue when that rises. */
-async function scaleLocks(o: Ops): Promise<void> {
-  if (!Object.values(await loadLocks(o)).some(l => l.scale)) return
-  const budget = await machineBudget(o)
-  if (!budget) return
-  const now = await o.now()
-  const changes: { resource: string; from: number; to: number; promoted: Holder[] }[] = []
-  await changeLocks(o, all => {
-    let next = all
-    for (const [resource, lock] of Object.entries(all)) {
-      const to = scaledCapacityOf(lock, budget, now)
-      if (to === lock.capacity) continue
-      const scaled = defineIn(next, resource, to, now)
-      next = scaled.next
-      changes.push({ resource, from: lock.capacity, to, promoted: scaled.promoted })
-    }
-    return { next }
-  })
-  for (const c of changes) {
-    o.log(`machine-locks: ${c.resource} capacity ${c.from} -> ${c.to}, ${Math.round(budget.freeMb / 1024)} GB free, load ${budget.load.toFixed(1)}`)
-    await grant(o, c.resource, c.promoted)
-  }
 }
 
 /** A holder whose session is gone never releases: when someone waits on its lock, its slot goes to the next in line. */
@@ -241,15 +239,18 @@ async function alertLongHolds(o: Ops, now: number): Promise<void> {
   )
 }
 
-/** Scaling and the dead-holder check run once per sweep for the whole machine, whichever session gets there first. */
+/** True for the one session that gets there first in this period: each machine-wide check runs once, not once per session. */
+async function isDue(o: Ops, key: string, periodMs: number, now: number): Promise<boolean> {
+  if (now - Number((await o.get(key)) ?? 0) < periodMs - periodMs / 10) return false
+  await o.set(key, now)
+  return true
+}
+
 async function sweep(o: Ops): Promise<void> {
   const now = await o.now()
   await alertLongHolds(o, now)
-  const last = Number((await o.get(SWEEP_KEY)) ?? 0)
-  if (now - last < SWEEP_MS - 10_000) return
-  await o.set(SWEEP_KEY, now)
-  await scaleLocks(o)
-  await freeDead(o)
+  if (await isDue(o, ADMIT_KEY, ADMIT_MS, now)) await admit(o)
+  if (await isDue(o, SWEEP_KEY, SWEEP_MS, now)) await freeDead(o)
 }
 
 const answer = (text: string) => ({ result: text }) as never
@@ -259,22 +260,25 @@ type Input = { action?: string; resource?: string; capacity?: number; memoryGb?:
 async function define(o: Ops, resource: string, input: Input): Promise<string> {
   const capacity = Math.max(1, Math.floor(input.capacity ?? 1))
   const now = await o.now()
-  const isScaled = (input.memoryGb ?? 0) > 0 || (input.cores ?? 0) > 0
-  const scale = isScaled ? { max: capacity, ...(input.memoryGb ? { memoryMb: Math.round(input.memoryGb * 1024) } : {}), ...(input.cores ? { cores: input.cores } : {}) } : null
-  const budget = isScaled ? await machineBudget(o) : null
-  const { next, promoted } = await changeLocks(o, all => {
-    const draft = defineIn(all, resource, capacity, now, scale).next[resource]
-    return defineIn(all, resource, budget && draft ? scaledCapacityOf(draft, budget, now) : capacity, now, scale, input.guard)
-  })
-  const granted = await grant(o, resource, promoted)
-  const effective = next[resource]?.capacity ?? capacity
-  const sizing = isScaled ? `, scaled: capacity ${effective} of max ${capacity}${budget ? '' : ' (machine not measured yet)'}` : `, capacity ${capacity}`
+  const isBudgeted = (input.memoryGb ?? 0) > 0 || (input.cores ?? 0) > 0
+  const scale = isBudgeted ? { max: capacity, ...(input.memoryGb ? { memoryMb: Math.round(input.memoryGb * 1024) } : {}), ...(input.cores ? { cores: input.cores } : {}) } : null
+  const { promoted } = await changeLocks(o, all => defineIn(all, resource, capacity, now, scale, input.guard))
+  const granted = [...(await grant(o, resource, promoted)), ...(await admit(o))]
+  const cost = [input.memoryGb ? `${input.memoryGb} GB` : '', input.cores ? `${input.cores} cores` : ''].filter(Boolean).join(' and ')
+  const sizing = isBudgeted ? `, up to ${capacity} slots of ${cost} each, granted from the machine's memory and cores shared with every budgeted resource` : `, capacity ${capacity}`
   return `${resource} defined${sizing}${granted.length ? `, granted to ${granted.map(nameOf).join(', ')}` : ''}`
 }
 
 async function acquire(o: Ops, resource: string, label: string): Promise<string> {
   const holder: Holder = { session: await o.id(), name: await selfName(o), ...(label ? { label } : {}), since: await o.now() }
-  const { outcome, ahead } = await changeLocks(o, all => acquireIn(all, resource, holder))
+  const queued = await changeLocks(o, all => acquireIn(all, resource, holder))
+  let { outcome, ahead } = queued
+  if (outcome === 'queued' && queued.next[resource]?.scale) {
+    await admit(o, holder)
+    const lock = (await loadLocks(o))[resource]
+    if (lock?.holders.some(h => h.session === holder.session && (h.label ?? '') === label)) outcome = 'granted'
+    else ahead = budgetQueueOf(await loadLocks(o)).findIndex(w => w.holder.session === holder.session && (w.holder.label ?? '') === label)
+  }
   if (outcome === 'unknown') return `${resource} is not defined: "list" shows the resources, "define" adds one`
   if (outcome === 'granted') return `${resource} granted: it is yours until you release it`
   return `${resource} queued, ${ahead} ahead: do not use it yet, end your turn on "Waiting on ${resource}${label ? ` for ${label}` : ''}"; a GRANTED ${resource} message wakes you`
@@ -361,7 +365,7 @@ export const register: Register = on => {
         required: ['action'],
       },
     })
-    $.clock.every(SWEEP_MS, () => {
+    $.clock.every(ADMIT_MS, () => {
       void sweep(o).catch(error => o.log(`machine-locks sweep: ${String(error)}`))
     })
     return started

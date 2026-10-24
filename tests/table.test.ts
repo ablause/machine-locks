@@ -1,6 +1,6 @@
 import { expect, test } from 'claude-code/testing'
 
-import { acquireIn, budgetOf, deadHoldersOf, defineIn, guardVerdictOf, historyStatsOf, historyWith, HISTORY_SIZE, liveSessionsOf, longHeldOf, LONG_HOLD_MS, releaseIn, removeIn, scaledCapacityOf } from '../hooks/table'
+import { acquireIn, admitIn, budgetOf, deadHoldersOf, defineIn, guardVerdictOf, historyStatsOf, historyWith, HISTORY_SIZE, liveSessionsOf, longHeldOf, LONG_HOLD_MS, releaseIn, removeIn, roomOf } from '../hooks/table'
 
 const one = { simulator: { capacity: 1, holders: [], queue: [] } }
 const a = { session: 'a', name: 'alpha', since: 0 }
@@ -48,10 +48,43 @@ test('a raised capacity grants the queue at once', () => {
 
 const budget = { totalMb: 32_768, freeMb: 16_384, load: 2, cores: 10 }
 
-test('a scaled lock follows the memory left above the floor', () => {
-  const lock = { capacity: 1, holders: [], queue: [], scale: { max: 4, memoryMb: 4096 } }
-  // 16 GB free less the 6.4 GB floor leaves room for two 4 GB slots.
-  expect(scaledCapacityOf(lock, budget, 0)).toBe(2)
+const ios = { max: 6, memoryMb: 4096 }
+const android = { max: 4, memoryMb: 4096 }
+const c = { session: 'c', name: 'gamma', since: 2 }
+// 16 GB free less the 6.4 GB floor: room for two 4 GB slots, not three.
+const room = (all: Parameters<typeof roomOf>[0], now = 0) => roomOf(all, budget, now)
+
+test('a budgeted lock only queues on acquire: the machine decides', () => {
+  const table = { 'ios-simulator': { capacity: 6, holders: [], queue: [], scale: ios } }
+  expect(acquireIn(table, 'ios-simulator', a).outcome).toBe('queued')
+})
+
+test('every budgeted resource draws on one room: an iOS slot still booting counts against Android', () => {
+  const table = {
+    'ios-simulator': { capacity: 6, holders: [{ ...a, since: 0 }, { ...c, since: 0 }], queue: [], scale: ios },
+    'android-emulator': { capacity: 4, holders: [], queue: [b], scale: android },
+  }
+  expect(admitIn(table, room(table, 60_000), 60_000).promoted).toEqual([])
+  expect(admitIn(table, room(table, 4 * 60_000), 4 * 60_000).promoted.map(p => p.resource)).toEqual(['android-emulator'])
+})
+
+test('the line is served in asking order across resources and stops at the first that does not fit', () => {
+  const table = {
+    'android-emulator': { capacity: 4, holders: [], queue: [{ ...b, since: 1 }], scale: { max: 4, memoryMb: 8192 } },
+    'ios-simulator': { capacity: 6, holders: [], queue: [{ ...c, since: 2 }], scale: { max: 6, memoryMb: 1024 } },
+  }
+  expect(admitIn(table, { memoryMb: 5000, cores: 8 }, 0).promoted).toEqual([])
+  expect(admitIn(table, { memoryMb: 9000, cores: 8 }, 0).promoted.map(p => p.holder.session)).toEqual(['b'])
+  expect(admitIn(table, { memoryMb: 9500, cores: 8 }, 0).promoted.map(p => p.holder.session)).toEqual(['b', 'c'])
+})
+
+test('a waiter whose own lock is at its max is passed, and without a measure only the max counts', () => {
+  const table = {
+    'ios-simulator': { capacity: 1, holders: [a], queue: [{ ...c, since: 1 }], scale: { max: 1, memoryMb: 1024 } },
+    'android-emulator': { capacity: 4, holders: [], queue: [{ ...b, since: 2 }], scale: android },
+  }
+  expect(admitIn(table, { memoryMb: 9000, cores: 8 }, 0).promoted.map(p => p.holder.session)).toEqual(['b'])
+  expect(admitIn(table, null, 0).promoted.map(p => p.holder.session)).toEqual(['b'])
 })
 
 test('the machine budget is read from sysctl and memory_pressure', () => {
