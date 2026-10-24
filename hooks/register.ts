@@ -19,6 +19,8 @@ type Ops = {
   send: (sessionId: string, text: string) => Promise<boolean>
   submit: (text: string) => Promise<unknown>
   log: (text: string) => void
+  /** Set inside a tool.call hook, where a prompt.submit would wait on the very turn the hook holds: grants to this session land here and go out in the tool's answer. */
+  ownGrants?: string[]
 }
 
 const opsOf = ($: EngineInterface): Ops => ({
@@ -82,7 +84,8 @@ const grantText = (resource: string, h: Holder) =>
 /** Tells the session it now holds the slot; false when it cannot be reached. */
 async function notify(o: Ops, resource: string, h: Holder): Promise<boolean> {
   if (h.session === (await o.id())) {
-    await o.submit(`[machine-locks] ${grantText(resource, h)}`)
+    if (o.ownGrants) o.ownGrants.push(grantText(resource, h))
+    else await o.submit(`[machine-locks] ${grantText(resource, h)}`)
     return true
   }
   try {
@@ -246,6 +249,21 @@ async function releaseFor(o: Ops, resource: string, input: Input): Promise<strin
   return `${resource} released${handed.length ? `, granted to ${handed.join(', ')}` : ''}`
 }
 
+async function respond(o: Ops, input: Input): Promise<string> {
+  const { action = '', resource = '', label = '' } = input
+  if (action === 'list') return JSON.stringify(await loadLocks(o), null, 1)
+  if (resource === '') return 'resource is required'
+  if (action === 'define') return define(o, resource, input)
+  if (action === 'acquire') return acquire(o, resource, label)
+  if (action === 'release') return releaseFor(o, resource, input)
+  if (action === 'remove') {
+    const session = await o.id()
+    const { heldBy } = await changeLocks(o, all => removeIn(all, resource, session))
+    return heldBy.length ? `${resource} kept: another session still holds or waits on it (${heldBy.join(', ')})` : `${resource} removed`
+  }
+  return `unknown action ${action}`
+}
+
 export const register: Register = on => {
   on('engine.create', async (_$, e, next) => {
     const built = await next(e)
@@ -290,20 +308,9 @@ export const register: Register = on => {
   })
 
   on('tool.call', { tool: TOOL_ID }, async ($, e) => {
-    const o = opsOf($)
-    const input = e as unknown as Input
-    const { action = '', resource = '', label = '' } = input
-    if (action === 'list') return answer(JSON.stringify(await loadLocks(o), null, 1))
-    if (resource === '') return answer('resource is required')
-    if (action === 'define') return answer(await define(o, resource, input))
-    if (action === 'acquire') return answer(await acquire(o, resource, label))
-    if (action === 'release') return answer(await releaseFor(o, resource, input))
-    if (action === 'remove') {
-      const session = await o.id()
-      const { heldBy } = await changeLocks(o, all => removeIn(all, resource, session))
-      return answer(heldBy.length ? `${resource} kept: another session still holds or waits on it (${heldBy.join(', ')})` : `${resource} removed`)
-    }
-    return answer(`unknown action ${action}`)
+    const ownGrants: string[] = []
+    const reply = await respond({ ...opsOf($), ownGrants }, e as unknown as Input)
+    return answer([reply, ...ownGrants].join('\n'))
   })
 
   // A session that ends for good frees its slots. A background session paused by its supervisor ends with

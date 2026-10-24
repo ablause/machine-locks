@@ -56,6 +56,18 @@ test('the second session waits, and is told GRANTED when the first releases', as
   expect(m.sent[0]?.text).toStartWith('GRANTED simulator:')
 })
 
+test('a session queued for a second slot of its own resource is told GRANTED in the release answer', async ($, on) => {
+  const m = machine(on)
+  await $.session.start({ cwd: '/w/a', surface: null, isInteractive: false })
+  await call($, { action: 'define', resource: 'simulator', capacity: 1 })
+  await call($, { action: 'acquire', resource: 'simulator', label: 'T1' })
+  expect(await call($, { action: 'acquire', resource: 'simulator', label: 'T2' })).toContain('queued')
+  const released = await call($, { action: 'release', resource: 'simulator', label: 'T1' })
+  expect(released).toStartWith('simulator released, granted to session-a')
+  expect(released).toContain('GRANTED simulator T2:')
+  expect(m.prompts).toEqual([])
+})
+
 test('a GRANTED that reaches nobody passes the slot to the next in line', async ($, on) => {
   const m = machine(on)
   await $.session.start({ cwd: '/w/a', surface: null, isInteractive: false })
