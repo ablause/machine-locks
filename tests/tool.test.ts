@@ -186,3 +186,14 @@ test('a change waits while another session holds the mutex', async ($, on) => {
   await m.clock.advance(100)
   expect(await defined).toBe('simulator defined, capacity 1')
 })
+
+test('Bash refuses a device boot until the session holds a slot', async ($, on) => {
+  machine(on)
+  on('tool.call', { tool: 'Bash' }, () => ({ result: 'booted' }) as never)
+  await $.session.start({ cwd: '/w/a', surface: null, isInteractive: false })
+  await call($, { action: 'define', resource: 'ios-simulator', capacity: 1 })
+  const boot = () => $.tool.call({ tool: 'Bash', command: 'xcrun simctl boot 1234' } as never) as Promise<{ deny?: string; result?: unknown }>
+  expect((await boot()).deny).toContain('needs a ios-simulator slot')
+  await call($, { action: 'acquire', resource: 'ios-simulator', label: 'T1' })
+  expect((await boot()).result).toBe('booted')
+})

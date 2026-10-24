@@ -1,6 +1,6 @@
 import type { EngineInterface, Register } from 'claude-code'
-import type { MachineLocks, MachineLocksHolder as Holder, MachineLocksRelease as Release, MachineLocksTable as Locks } from '../types'
-import { acquireIn, budgetOf, deadHoldersOf, defineIn, liveSessionsOf, LOCKS_KEY, longHeldOf, nameOf, releaseIn, removeIn, scaledCapacityOf } from './table'
+import type { MachineLocks, MachineLocksGuard as Guard, MachineLocksHolder as Holder, MachineLocksRelease as Release, MachineLocksTable as Locks } from '../types'
+import { acquireIn, budgetOf, deadHoldersOf, defineIn, guardVerdictOf, liveSessionsOf, LOCKS_KEY, longHeldOf, nameOf, releaseIn, removeIn, scaledCapacityOf } from './table'
 import type { AgentRow, Budget } from './table'
 
 type Run = { exitCode: number; stdout: string }
@@ -44,7 +44,7 @@ const SWEEP_KEY = 'sweepAt'
 const ALERTED_KEY = 'alerted'
 
 const DESCRIPTION = `Exclusive resources shared by every Claude session on this machine (a simulator or device, a local database, fixed ports, build capacity), so two sessions never use one at once.
-Actions: "list" (every resource with its capacity, holders and queue); "define" (resource, capacity; add memoryGb and/or cores, what one slot uses, and capacity becomes the max: the capacity then follows the machine's free memory and load); "acquire" (resource, label: answers granted, or queued with how many are ahead; when queued, do not touch the resource and end your turn on "Waiting on <resource> for <label>": a GRANTED <resource> message wakes you once a slot frees); "release" (resource, label: frees your slot as soon as you are done, and the next session in line is told); "remove" (resource, refused while another session holds or waits on it).
+Actions: "list" (every resource with its capacity, holders and queue); "define" (resource, capacity; add memoryGb and/or cores, what one slot uses, and capacity becomes the max: the capacity then follows the machine's free memory and load; add guard to have Bash refuse the commands that need a slot of it, or that act on every session's instance at once); "acquire" (resource, label: answers granted, or queued with how many are ahead; when queued, do not touch the resource and end your turn on "Waiting on <resource> for <label>": a GRANTED <resource> message wakes you once a slot frees); "release" (resource, label: frees your slot as soon as you are done, and the next session in line is told); "remove" (resource, refused while another session holds or waits on it).
 "label" says what the slot is for, your task id in a coordinator run; a second slot of the same resource takes another label (T2#2). Every slot of this session is freed when it exits.`
 
 async function loadLocks(o: Ops): Promise<Locks> {
@@ -245,7 +245,7 @@ async function sweep(o: Ops): Promise<void> {
 
 const answer = (text: string) => ({ result: text }) as never
 
-type Input = { action?: string; resource?: string; capacity?: number; memoryGb?: number; cores?: number; label?: string; holder?: string }
+type Input = { action?: string; resource?: string; capacity?: number; memoryGb?: number; cores?: number; label?: string; holder?: string; guard?: Guard }
 
 async function define(o: Ops, resource: string, input: Input): Promise<string> {
   const capacity = Math.max(1, Math.floor(input.capacity ?? 1))
@@ -255,7 +255,7 @@ async function define(o: Ops, resource: string, input: Input): Promise<string> {
   const budget = isScaled ? await machineBudget(o) : null
   const { next, promoted } = await changeLocks(o, all => {
     const draft = defineIn(all, resource, capacity, now, scale).next[resource]
-    return defineIn(all, resource, budget && draft ? scaledCapacityOf(draft, budget, now) : capacity, now, scale)
+    return defineIn(all, resource, budget && draft ? scaledCapacityOf(draft, budget, now) : capacity, now, scale, input.guard)
   })
   const granted = await grant(o, resource, promoted)
   const effective = next[resource]?.capacity ?? capacity
@@ -339,6 +339,14 @@ export const register: Register = on => {
           cores: { type: 'number', description: 'define: the cores one slot uses' },
           label: { type: 'string', description: 'acquire, release: what the slot is for, your task id in a coordinator run' },
           holder: { type: 'string', description: 'release: the session id or name of a session that is gone, to free its slot' },
+          guard: {
+            type: 'object',
+            description: 'define: regular expressions matched against Bash commands. ios-simulator and android-emulator watch their device commands without one',
+            properties: {
+              needs: { type: 'array', items: { type: 'string' }, description: 'commands that run only while this session holds a slot' },
+              forbid: { type: 'array', items: { type: 'string' }, description: 'commands that never run: they act on every session at once' },
+            },
+          },
         },
         required: ['action'],
       },
@@ -353,6 +361,14 @@ export const register: Register = on => {
     const ownGrants: string[] = []
     const reply = await respond({ ...opsOf($), ownGrants }, e as unknown as Input)
     return answer([reply, ...ownGrants].join('\n'))
+  })
+
+  // Matching the command text, not what it runs: a script that boots a device passes, this only stops the slip.
+  on('tool.call', { tool: 'Bash' }, async ($, e, next) => {
+    const command = (e as unknown as { command?: unknown }).command
+    if (typeof command !== 'string') return next(e)
+    const reason = guardVerdictOf(await loadLocks(opsOf($)), command, await $.session.id(), TOOL_ID)
+    return reason ? { deny: reason } : next(e)
   })
 
   // A session that ends for good frees its slots. A background session paused by its supervisor ends with

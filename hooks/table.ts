@@ -1,4 +1,4 @@
-import type { MachineLocksHolder as Holder, MachineLocksLock as Lock, MachineLocksScale as LockScale, MachineLocksTable as Locks } from '../types'
+import type { MachineLocksGuard as Guard, MachineLocksHolder as Holder, MachineLocksLock as Lock, MachineLocksScale as LockScale, MachineLocksTable as Locks } from '../types'
 
 /** The `$.store` key every session on the machine shares. */
 export const LOCKS_KEY = 'locks'
@@ -38,10 +38,11 @@ export function releaseIn(all: Locks, resource: string, slot: Slot, now: number)
 }
 
 // A raised capacity grants the queue at once: a release only ever fills the slots it frees.
-// `scale` left undefined keeps the lock's own, so a rescale never drops it; null turns scaling off.
-export function defineIn(all: Locks, resource: string, capacity: number, now: number, scale?: LockScale | null): { next: Locks; promoted: Holder[] } {
+// `scale` and `guard` left undefined keep the lock's own, so a rescale never drops them; null turns them off.
+export function defineIn(all: Locks, resource: string, capacity: number, now: number, scale?: LockScale | null, guard?: Guard | null): { next: Locks; promoted: Holder[] } {
   const kept = scale === undefined ? all[resource]?.scale : (scale ?? undefined)
-  const base: Lock = { capacity, holders: all[resource]?.holders ?? [], queue: all[resource]?.queue ?? [], ...(kept ? { scale: kept } : {}) }
+  const keptGuard = guard === undefined ? all[resource]?.guard : (guard ?? undefined)
+  const base: Lock = { capacity, holders: all[resource]?.holders ?? [], queue: all[resource]?.queue ?? [], ...(kept ? { scale: kept } : {}), ...(keptGuard ? { guard: keptGuard } : {}) }
   const { lock, promoted } = fill(base, now)
   return { next: { ...all, [resource]: lock }, promoted }
 }
@@ -129,4 +130,47 @@ export const liveSessionsOf = (rows: readonly AgentRow[]) => new Set(rows.filter
 /** The holders of a lock someone waits on whose session is gone: nobody would ever release their slot. */
 export function deadHoldersOf(all: Locks, live: ReadonlySet<string>): { resource: string; holder: Holder }[] {
   return Object.entries(all).flatMap(([resource, lock]) => (lock.queue.length === 0 ? [] : lock.holders.filter(h => !live.has(h.session)).map(holder => ({ resource, holder }))))
+}
+
+const DEVICE_SCRIPT = String.raw`(?:scripts/device|\$D|\bdevice)\s+up\s+`
+
+/** What the mobile-devices skill's two resources watch when their lock was defined without a guard of its own. */
+export const KNOWN_GUARDS: Record<string, Guard> = {
+  'ios-simulator': {
+    needs: [`${DEVICE_SCRIPT}ios\\b`, String.raw`\bsimctl\s+(?:boot|create|clone)\b`],
+    forbid: [String.raw`\bsimctl\s+(?:shutdown|erase|delete)\s+all\b`, String.raw`\bsimctl\s+(?!list\b)\S+\b.*\bbooted\b`, String.raw`\bkillall\b.*\bSimulator\b`],
+  },
+  'android-emulator': {
+    needs: [`${DEVICE_SCRIPT}android\\b`, String.raw`\bemulator\s+(?:-avd\b|@)`],
+    forbid: [String.raw`\badb\s+kill-server\b`, String.raw`\b(?:killall|pkill)\b.*\b(?:emulator|qemu)`],
+  },
+}
+
+const matchOf = (sources: readonly string[] | undefined, command: string): string | null => {
+  for (const source of sources ?? []) {
+    try {
+      const found = new RegExp(source).exec(command)
+      if (found) return found[0]
+    } catch {
+      // A pattern that does not compile guards nothing: a typo in one define never blocks the shell.
+    }
+  }
+  return null
+}
+
+/** Why `command` may not run in `session`, or null: a forbidden command first, then a guarded one without a held slot. */
+export function guardVerdictOf(all: Locks, command: string, session: string, tool: string): string | null {
+  for (const [resource, lock] of Object.entries(all)) {
+    const guard = lock.guard ?? KNOWN_GUARDS[resource]
+    const forbidden = matchOf(guard?.forbid, command)
+    if (forbidden) return `machine-locks: "${forbidden}" acts on every session's ${resource} at once. Target your own instance by its id instead.`
+    const needed = matchOf(guard?.needs, command)
+    if (needed && !lock.holders.some(h => h.session === session)) {
+      const waiting = lock.queue.some(h => h.session === session)
+      return waiting
+        ? `machine-locks: "${needed}" needs a ${resource} slot and this session is still queued for one. End the turn on "Waiting on ${resource}": a GRANTED message wakes you.`
+        : `machine-locks: "${needed}" needs a ${resource} slot. Take one first through ${tool} (action acquire, resource ${resource}, your task as label), then run it again.`
+    }
+  }
+  return null
 }

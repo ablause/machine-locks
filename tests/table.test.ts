@@ -1,6 +1,6 @@
 import { expect, test } from 'claude-code/testing'
 
-import { acquireIn, budgetOf, deadHoldersOf, defineIn, liveSessionsOf, longHeldOf, LONG_HOLD_MS, releaseIn, removeIn, scaledCapacityOf } from '../hooks/table'
+import { acquireIn, budgetOf, deadHoldersOf, defineIn, guardVerdictOf, liveSessionsOf, longHeldOf, LONG_HOLD_MS, releaseIn, removeIn, scaledCapacityOf } from '../hooks/table'
 
 const one = { simulator: { capacity: 1, holders: [], queue: [] } }
 const a = { session: 'a', name: 'alpha', since: 0 }
@@ -71,4 +71,42 @@ test('a holder whose session is gone or failed is dead only where someone waits'
   const live = liveSessionsOf([{ sessionId: 'b', state: 'blocked' }, { sessionId: 'c', state: 'failed' }])
   const waited = { simulator: { capacity: 1, holders: [a], queue: [b] }, db: { capacity: 1, holders: [{ ...a, session: 'z' }], queue: [] } }
   expect(deadHoldersOf(waited, live)).toEqual([{ resource: 'simulator', holder: a }])
+})
+
+const devices = {
+  'ios-simulator': { capacity: 2, holders: [a], queue: [b] },
+  'android-emulator': { capacity: 2, holders: [], queue: [] },
+}
+const verdict = (command: string, session = 'a') => guardVerdictOf(devices, command, session, 'locks')
+
+test('booting a device needs a slot of its resource', () => {
+  expect(verdict('U=$($D up ios "app T1")')).toBeNull()
+  expect(verdict('xcrun simctl boot 1234')).toBeNull()
+  expect(verdict('S=$(~/.claude/skills/mobile-devices/scripts/device up android "app T1")')).toContain('needs a android-emulator slot. Take one first')
+  expect(verdict('nohup emulator -avd Pixel_9 &')).toContain('android-emulator')
+  expect(verdict('xcrun simctl create x y z', 'b')).toContain('still queued')
+})
+
+test('reads and commands aimed at one device pass', () => {
+  for (const command of ['xcrun simctl list devices booted', 'adb devices', 'adb -s emulator-5554 shell ls', 'xcrun simctl io 1234 screenshot s.png', 'git commit -m "up ios screen"']) {
+    expect(verdict(command, 'c')).toBeNull()
+  }
+})
+
+test('commands that hit every session at once never run, slot or not', () => {
+  for (const command of ['xcrun simctl shutdown all', 'xcrun simctl openurl booted app://x', 'killall Simulator', 'adb kill-server', 'pkill -f qemu-system']) {
+    expect(verdict(command)).toContain('acts on every session')
+  }
+})
+
+test("a lock's own guard replaces the default, and a broken pattern guards nothing", () => {
+  const table = { db: { capacity: 1, holders: [], queue: [], guard: { needs: ['\\bpsql\\b', '('] } }, 'ios-simulator': { capacity: 1, holders: [], queue: [], guard: {} } }
+  expect(guardVerdictOf(table, 'psql -c "drop table x"', 'a', 'locks')).toContain('needs a db slot')
+  expect(guardVerdictOf(table, 'xcrun simctl boot 1234', 'a', 'locks')).toBeNull()
+})
+
+test('define keeps a guard it is not given', () => {
+  const guarded = defineIn({}, 'db', 1, 0, undefined, { needs: ['psql'] }).next
+  expect(defineIn(guarded, 'db', 2, 0).next.db?.guard).toEqual({ needs: ['psql'] })
+  expect(defineIn(guarded, 'db', 2, 0, undefined, null).next.db?.guard).toBeUndefined()
 })

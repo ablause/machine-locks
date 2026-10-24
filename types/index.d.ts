@@ -4,7 +4,13 @@ export type MachineLocksHolder = { session: string; name: string; label?: string
 /** What one slot of a scaled lock costs the machine; its capacity then follows what is left, up to `max`. */
 export type MachineLocksScale = { max: number; memoryMb?: number; cores?: number }
 
-export type MachineLocksLock = { capacity: number; holders: MachineLocksHolder[]; queue: MachineLocksHolder[]; scale?: MachineLocksScale }
+/**
+ * The Bash commands a lock watches, as regular expression sources: `needs` runs only for a session holding a slot of
+ * it, `forbid` never runs, since it acts on every session's instance at once.
+ */
+export type MachineLocksGuard = { needs?: string[]; forbid?: string[] }
+
+export type MachineLocksLock = { capacity: number; holders: MachineLocksHolder[]; queue: MachineLocksHolder[]; scale?: MachineLocksScale; guard?: MachineLocksGuard }
 
 export type MachineLocksTable = Record<string, MachineLocksLock>
 
