@@ -7,8 +7,6 @@ import { bandModelOf } from './band'
 import type { BandModel, BandView, Slot } from './band'
 
 const bandView = atom({ plugin: 'machine-locks', key: 'band' } as const, null as BandView | null)
-// The run board draws the locks in a coordinator session: the band steps aside there rather than draw them twice.
-const runBoardIsActive = atom({ plugin: 'run-board', key: 'isActive' } as const, false)
 
 type Run = { exitCode: number; stdout: string }
 type RenderEvent = Parameters<EngineInterface['ui']['resolve']>[0]
@@ -397,7 +395,7 @@ function drawBand($: EngineInterface, e: RenderEvent, model: BandModel, below: R
 export const register: Register = on => {
   on('ui.render', { component: 'AbovePrompt' }, async ($, e, next) => {
     const below = await next(e)
-    if (e.props.hasSurvey || (await read($, runBoardIsActive))) return below
+    if (e.props.hasSurvey) return below
     const view = await read($, bandView)
     const model = view && bandModelOf(view)
     return model ? drawBand($, e, model, below) : below

@@ -44,6 +44,5 @@ declare module 'claude-code' {
   }
   interface PluginState {
     'machine-locks': { band: MachineLocksBandView | null }
-    'run-board': { isActive: boolean }
   }
 }

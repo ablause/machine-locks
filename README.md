@@ -33,8 +33,7 @@ once never overwrite each other; one left by a session killed mid-change is take
 
 A band above the prompt shows while this session holds or waits on a slot, or while sessions wait on the
 machine: the memory left for budgeted slots, each lock in use with its holders (this session's first, with how
-long it has held), this session's place in line, and buttons to release a slot or leave the line. It stays hidden
-in a coordinator session, whose run board draws the locks already.
+long it has held), this session's place in line, and buttons to release a slot or leave the line.
 
 A slot is held by a session (its id, its name as `claude agents` lists it, and an optional label such as
 a task id). A session that exits (`/exit`, `/clear`, logout) frees its slots. A background session paused
