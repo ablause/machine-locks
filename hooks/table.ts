@@ -1,4 +1,4 @@
-import type { MachineLocksGuard as Guard, MachineLocksHolder as Holder, MachineLocksLock as Lock, MachineLocksScale as LockScale, MachineLocksTable as Locks } from '../types'
+import type { MachineLocksGuard as Guard, MachineLocksHold as Hold, MachineLocksHolder as Holder, MachineLocksLock as Lock, MachineLocksScale as LockScale, MachineLocksTable as Locks } from '../types'
 
 /** The `$.store` key every session on the machine shares. */
 export const LOCKS_KEY = 'locks'
@@ -25,16 +25,56 @@ export function acquireIn(all: Locks, resource: string, holder: Holder): { next:
 /** Fills the free slots from the queue, in order; a promoted holder starts its hold now, not when it queued. */
 function fill(lock: Lock, now: number): { lock: Lock; promoted: Holder[] } {
   const room = Math.max(0, lock.capacity - lock.holders.length)
-  const promoted = lock.queue.slice(0, room).map(h => ({ ...h, since: now }))
+  const promoted = lock.queue.slice(0, room).map(h => ({ ...h, since: now, waitedMs: h.since === undefined ? 0 : now - h.since }))
   return { lock: { ...lock, holders: [...lock.holders, ...promoted], queue: lock.queue.slice(promoted.length) }, promoted }
 }
 
-export function releaseIn(all: Locks, resource: string, slot: Slot, now: number): { next: Locks; released: Holder[]; promoted: Holder[] } {
+export function releaseIn(all: Locks, resource: string, slot: Slot, now: number): { next: Locks; released: Holder[]; promoted: Holder[]; holds: Hold[] } {
   const lock = all[resource]
-  if (!lock) return { next: all, released: [], promoted: [] }
+  if (!lock) return { next: all, released: [], promoted: [], holds: [] }
   const released = [...lock.holders, ...lock.queue].filter(h => isMatch(h, slot))
+  const holds = lock.holders.filter(h => isMatch(h, slot)).map(h => holdOf(resource, h, now))
   const { lock: updated, promoted } = fill({ ...lock, holders: lock.holders.filter(h => !isMatch(h, slot)), queue: lock.queue.filter(q => !isMatch(q, slot)) }, now)
-  return { next: { ...all, [resource]: updated }, released, promoted }
+  return { next: { ...all, [resource]: updated }, released, promoted, holds }
+}
+
+const holdOf = (resource: string, h: Holder, now: number): Hold => ({
+  resource,
+  name: h.name,
+  ...(h.label ? { label: h.label } : {}),
+  releasedAt: now,
+  heldMs: h.since === undefined ? 0 : now - h.since,
+  waitedMs: h.waitedMs ?? 0,
+})
+
+/** The holds kept: enough weeks of work to size a capacity on, far under what `$.store` takes. */
+export const HISTORY_SIZE = 500
+
+export const historyWith = (history: readonly Hold[], holds: readonly Hold[]): Hold[] => [...history, ...holds].slice(-HISTORY_SIZE)
+
+const percentile = (sorted: readonly number[], p: number) => sorted[Math.min(sorted.length - 1, Math.floor(p * sorted.length))] ?? 0
+const minutesOf = (ms: number) => Math.round(ms / 6_000) / 10
+
+/** Per resource: how many holds, how often one queued, and the median and 90th percentile wait and hold, in minutes. */
+export function historyStatsOf(history: readonly Hold[]) {
+  const byResource = new Map<string, Hold[]>()
+  for (const h of history) byResource.set(h.resource, [...(byResource.get(h.resource) ?? []), h])
+  return Object.fromEntries(
+    [...byResource].map(([resource, holds]) => {
+      const waits = holds.map(h => h.waitedMs).sort((x, y) => x - y)
+      const helds = holds.map(h => h.heldMs).sort((x, y) => x - y)
+      return [
+        resource,
+        {
+          holds: holds.length,
+          queued: holds.filter(h => h.waitedMs > 0).length,
+          waitMinutes: { p50: minutesOf(percentile(waits, 0.5)), p90: minutesOf(percentile(waits, 0.9)) },
+          holdMinutes: { p50: minutesOf(percentile(helds, 0.5)), p90: minutesOf(percentile(helds, 0.9)) },
+          since: holds[0]?.releasedAt,
+        },
+      ]
+    }),
+  )
 }
 
 // A raised capacity grants the queue at once: a release only ever fills the slots it frees.

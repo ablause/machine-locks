@@ -1,6 +1,6 @@
 import { expect, test } from 'claude-code/testing'
 
-import { acquireIn, budgetOf, deadHoldersOf, defineIn, guardVerdictOf, liveSessionsOf, longHeldOf, LONG_HOLD_MS, releaseIn, removeIn, scaledCapacityOf } from '../hooks/table'
+import { acquireIn, budgetOf, deadHoldersOf, defineIn, guardVerdictOf, historyStatsOf, historyWith, HISTORY_SIZE, liveSessionsOf, longHeldOf, LONG_HOLD_MS, releaseIn, removeIn, scaledCapacityOf } from '../hooks/table'
 
 const one = { simulator: { capacity: 1, holders: [], queue: [] } }
 const a = { session: 'a', name: 'alpha', since: 0 }
@@ -23,8 +23,8 @@ test('a release hands the slot to the first in line, its hold starting now', () 
   const queued = acquireIn(acquireIn(one, 'simulator', a).next, 'simulator', b).next
   const { next, released, promoted } = releaseIn(queued, 'simulator', { session: 'a' }, 500)
   expect(released.map(h => h.session)).toEqual(['a'])
-  expect(promoted).toEqual([{ ...b, since: 500 }])
-  expect(next.simulator?.holders).toEqual([{ ...b, since: 500 }])
+  expect(promoted).toEqual([{ ...b, since: 500, waitedMs: 500 }])
+  expect(next.simulator?.holders).toEqual([{ ...b, since: 500, waitedMs: 500 }])
 })
 
 test('a labelled release frees only that slot of the session', () => {
@@ -109,4 +109,28 @@ test('define keeps a guard it is not given', () => {
   const guarded = defineIn({}, 'db', 1, 0, undefined, { needs: ['psql'] }).next
   expect(defineIn(guarded, 'db', 2, 0).next.db?.guard).toEqual({ needs: ['psql'] })
   expect(defineIn(guarded, 'db', 2, 0, undefined, null).next.db?.guard).toBeUndefined()
+})
+
+test('a release records the hold with the wait that preceded it', () => {
+  const held = acquireIn(one, 'simulator', a).next
+  const queued = acquireIn(held, 'simulator', { ...b, since: 60_000 }).next
+  const first = releaseIn(queued, 'simulator', { session: 'a' }, 240_000)
+  expect(first.holds).toEqual([{ resource: 'simulator', name: 'alpha', releasedAt: 240_000, heldMs: 240_000, waitedMs: 0 }])
+  const second = releaseIn(first.next, 'simulator', { session: 'b' }, 600_000)
+  expect(second.holds[0]).toMatchObject({ name: 'beta', heldMs: 360_000, waitedMs: 180_000 })
+})
+
+test('a queued slot given up records no hold, and the history keeps only the latest', () => {
+  const queued = acquireIn(acquireIn(one, 'simulator', a).next, 'simulator', b).next
+  expect(releaseIn(queued, 'simulator', { session: 'b' }, 1).holds).toEqual([])
+  const hold = { resource: 'simulator', name: 'alpha', releasedAt: 0, heldMs: 0, waitedMs: 0 }
+  expect(historyWith(Array(HISTORY_SIZE).fill(hold), [{ ...hold, name: 'last' }]).at(-1)?.name).toBe('last')
+  expect(historyWith(Array(HISTORY_SIZE).fill(hold), [hold])).toHaveLength(HISTORY_SIZE)
+})
+
+test('history stats count the queued holds and read wait and hold in minutes', () => {
+  const hold = (waitedMs: number, heldMs: number) => ({ resource: 'simulator', name: 'x', releasedAt: 0, heldMs, waitedMs })
+  expect(historyStatsOf([hold(0, 600_000), hold(120_000, 1_200_000), hold(0, 1_800_000)])).toEqual({
+    simulator: { holds: 3, queued: 1, waitMinutes: { p50: 0, p90: 2 }, holdMinutes: { p50: 20, p90: 30 }, since: 0 },
+  })
 })

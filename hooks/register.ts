@@ -1,6 +1,6 @@
 import type { EngineInterface, Register } from 'claude-code'
-import type { MachineLocks, MachineLocksGuard as Guard, MachineLocksHolder as Holder, MachineLocksRelease as Release, MachineLocksTable as Locks } from '../types'
-import { acquireIn, budgetOf, deadHoldersOf, defineIn, guardVerdictOf, liveSessionsOf, LOCKS_KEY, longHeldOf, nameOf, releaseIn, removeIn, scaledCapacityOf } from './table'
+import type { MachineLocks, MachineLocksGuard as Guard, MachineLocksHold as Hold, MachineLocksHolder as Holder, MachineLocksRelease as Release, MachineLocksTable as Locks } from '../types'
+import { acquireIn, budgetOf, deadHoldersOf, defineIn, guardVerdictOf, historyStatsOf, historyWith, liveSessionsOf, LOCKS_KEY, longHeldOf, nameOf, releaseIn, removeIn, scaledCapacityOf } from './table'
 import type { AgentRow, Budget } from './table'
 
 type Run = { exitCode: number; stdout: string }
@@ -42,9 +42,10 @@ const TOOL_ID = 'mcp__machine-locks__locks'
 const SWEEP_MS = 3 * 60_000
 const SWEEP_KEY = 'sweepAt'
 const ALERTED_KEY = 'alerted'
+const HISTORY_KEY = 'history'
 
 const DESCRIPTION = `Exclusive resources shared by every Claude session on this machine (a simulator or device, a local database, fixed ports, build capacity), so two sessions never use one at once.
-Actions: "list" (every resource with its capacity, holders and queue); "define" (resource, capacity; add memoryGb and/or cores, what one slot uses, and capacity becomes the max: the capacity then follows the machine's free memory and load; add guard to have Bash refuse the commands that need a slot of it, or that act on every session's instance at once); "acquire" (resource, label: answers granted, or queued with how many are ahead; when queued, do not touch the resource and end your turn on "Waiting on <resource> for <label>": a GRANTED <resource> message wakes you once a slot frees); "release" (resource, label: frees your slot as soon as you are done, and the next session in line is told); "remove" (resource, refused while another session holds or waits on it).
+Actions: "list" (every resource with its capacity, holders and queue); "history" (per resource, how often a slot was queued for and how long slots waited and were held: what to size a capacity or memoryGb on); "define" (resource, capacity; add memoryGb and/or cores, what one slot uses, and capacity becomes the max: the capacity then follows the machine's free memory and load; add guard to have Bash refuse the commands that need a slot of it, or that act on every session's instance at once); "acquire" (resource, label: answers granted, or queued with how many are ahead; when queued, do not touch the resource and end your turn on "Waiting on <resource> for <label>": a GRANTED <resource> message wakes you once a slot frees); "release" (resource, label: frees your slot as soon as you are done, and the next session in line is told); "remove" (resource, refused while another session holds or waits on it).
 "label" says what the slot is for, your task id in a coordinator run; a second slot of the same resource takes another label (T2#2). Every slot of this session is freed when it exits.`
 
 async function loadLocks(o: Ops): Promise<Locks> {
@@ -153,9 +154,17 @@ async function grant(o: Ops, resource: string, promoted: Holder[]): Promise<Hold
   return granted
 }
 
+const loadHistory = async (o: Ops) => ((await o.get(HISTORY_KEY)) as Hold[] | undefined) ?? []
+
+async function record(o: Ops, holds: Hold[]): Promise<void> {
+  if (holds.length === 0) return
+  await withMutex(o, async () => o.set(HISTORY_KEY, historyWith(await loadHistory(o), holds))).catch(error => o.log(`machine-locks history: ${String(error)}`))
+}
+
 async function release(o: Ops, resource: string, slot: { session: string; label?: string }): Promise<Release[]> {
   const now = await o.now()
-  const { released, promoted } = await changeLocks(o, all => releaseIn(all, resource, slot, now))
+  const { released, promoted, holds } = await changeLocks(o, all => releaseIn(all, resource, slot, now))
+  await record(o, holds)
   return released.length === 0 ? [] : [{ resource, released, granted: await grant(o, resource, promoted) }]
 }
 
@@ -293,6 +302,7 @@ async function releaseFor(o: Ops, resource: string, input: Input): Promise<strin
 async function respond(o: Ops, input: Input): Promise<string> {
   const { action = '', resource = '', label = '' } = input
   if (action === 'list') return JSON.stringify(await loadLocks(o), null, 1)
+  if (action === 'history') return JSON.stringify(historyStatsOf(await loadHistory(o)), null, 1)
   if (resource === '') return 'resource is required'
   if (action === 'define') return define(o, resource, input)
   if (action === 'acquire') return acquire(o, resource, label)
@@ -332,7 +342,7 @@ export const register: Register = on => {
       inputSchema: {
         type: 'object',
         properties: {
-          action: { enum: ['list', 'define', 'acquire', 'release', 'remove'] },
+          action: { enum: ['list', 'history', 'define', 'acquire', 'release', 'remove'] },
           resource: { type: 'string' },
           capacity: { type: 'number' },
           memoryGb: { type: 'number', description: 'define: the memory one slot uses, device and dev server included' },

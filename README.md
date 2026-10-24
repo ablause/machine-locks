@@ -12,7 +12,9 @@ Every session gets the `mcp__machine-locks__locks` tool:
   always leaving a fifth of the memory free;
 - `acquire` answers granted, or queued with how many are ahead. A queued session stops there: when a slot
   frees, the session that frees it sends it `GRANTED <resource>` directly, which wakes it;
-- `release` frees the slot and tells the next in line; `list` and `remove` do what they say.
+- `release` frees the slot and tells the next in line; `list` and `remove` do what they say;
+- `history` gives, per resource, how many holds, how many queued first, and the median and 90th percentile wait
+  and hold in minutes, over the last 500 slots released: what to set a capacity or `memoryGb` from.
 
 Bash checks every command against the locks before it runs. A command a lock `needs` runs only in a session that
 holds a slot of it; a command it `forbids` never runs, since it acts on every session's instance at once. Without a

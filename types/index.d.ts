@@ -1,5 +1,11 @@
-/** A session holding or waiting on one slot. `label` tells two slots of one session apart (`T2#2`) and says what it is for. */
-export type MachineLocksHolder = { session: string; name: string; label?: string; since?: number }
+/**
+ * A session holding or waiting on one slot. `label` tells two slots of one session apart (`T2#2`) and says what it is for.
+ * `since` is when it queued, then when it was granted; `waitedMs` how long it queued before that.
+ */
+export type MachineLocksHolder = { session: string; name: string; label?: string; since?: number; waitedMs?: number }
+
+/** One slot from its grant to its release, kept to size capacities on what the machine went through. */
+export type MachineLocksHold = { resource: string; name: string; label?: string; releasedAt: number; heldMs: number; waitedMs: number }
 
 /** What one slot of a scaled lock costs the machine; its capacity then follows what is left, up to `max`. */
 export type MachineLocksScale = { max: number; memoryMb?: number; cores?: number }
