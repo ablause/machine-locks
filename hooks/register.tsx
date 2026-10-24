@@ -1,9 +1,17 @@
-import type { EngineInterface, Register } from 'claude-code'
+import { atom, read, update } from 'claude-code'
+import type { EngineInterface, Register, RenderChildren } from 'claude-code'
 import type { MachineLocks, MachineLocksGuard as Guard, MachineLocksHold as Hold, MachineLocksHolder as Holder, MachineLocksRelease as Release, MachineLocksTable as Locks } from '../types'
 import { acquireIn, admitIn, budgetOf, budgetQueueOf, deadHoldersOf, defineIn, guardVerdictOf, historyStatsOf, historyWith, liveSessionsOf, LOCKS_KEY, longHeldOf, nameOf, releaseIn, removeIn, roomOf } from './table'
 import type { AgentRow, Budget } from './table'
+import { bandModelOf } from './band'
+import type { BandModel, BandView, Slot } from './band'
+
+const bandView = atom({ plugin: 'machine-locks', key: 'band' } as const, null as BandView | null)
+// The run board draws the locks in a coordinator session: the band steps aside there rather than draw them twice.
+const runBoardIsActive = atom({ plugin: 'run-board', key: 'isActive' } as const, false)
 
 type Run = { exitCode: number; stdout: string }
+type RenderEvent = Parameters<EngineInterface['ui']['resolve']>[0]
 
 /**
  * What the lock code needs of `$`, built from a hook's or from the one `engine.create` returns: the engine
@@ -246,6 +254,16 @@ async function isDue(o: Ops, key: string, periodMs: number, now: number): Promis
   return true
 }
 
+/** Measures the machine only when the band will draw it: a session with nothing held, queued or waited on spawns nothing. */
+async function refreshBand($: EngineInterface, o: Ops): Promise<void> {
+  const locks = await loadLocks(o)
+  const session = await o.id()
+  const isInvolved = Object.values(locks).some(l => [...l.holders, ...l.queue].some(h => h.session === session)) || budgetQueueOf(locks).length > 0
+  const budget = isInvolved && Object.values(locks).some(l => l.scale) ? await machineBudget(o) : null
+  const now = await o.now()
+  await update($, bandView, () => ({ session, at: now, locks, room: budget ? roomOf(locks, budget, now) : null, totalMb: budget?.totalMb ?? null }))
+}
+
 async function sweep(o: Ops): Promise<void> {
   const now = await o.now()
   await alertLongHolds(o, now)
@@ -319,7 +337,72 @@ async function respond(o: Ops, input: Input): Promise<string> {
   return `unknown action ${action}`
 }
 
+const ACCENT = '#d97757'
+const WARN = '#f5a524'
+const RULE = '#3e4451'
+const GAUGE_CELLS = 10
+
+const slotName = (s: Slot) => s.label || s.resource
+
+async function releaseFromBand($: EngineInterface, slot: Slot): Promise<void> {
+  const o = opsOf($)
+  await release(o, slot.resource, { session: await o.id(), label: slot.label })
+  await refreshBand($, o)
+}
+
+/** One line for the machine and the locks in use, then this session's buttons, above the engine's own band. */
+function drawBand($: EngineInterface, e: RenderEvent, model: BandModel, below: RenderChildren) {
+  const { Box, Button, Text } = $.ui.resolve(e)
+  const filled = Math.round(model.gauge ? model.gauge.share * GAUGE_CELLS : 0)
+  return (
+    <Box key="machine-locks-band" flexDirection="column">
+      <Box flexWrap="wrap" columnGap={3}>
+        <Text dimColor>verrous</Text>
+        {model.gauge && (
+          <Text key="gauge">
+            <Text dimColor>machine </Text>
+            <Text color={model.gauge.isFull ? WARN : ACCENT}>{'█'.repeat(filled)}</Text>
+            <Text color={RULE}>{'░'.repeat(GAUGE_CELLS - filled)}</Text>
+            <Text dimColor>{` ${model.gauge.freeGb} Go libres sur ${model.gauge.usableGb}`}</Text>
+          </Text>
+        )}
+        {model.rows.map(r => (
+          <Text key={`lock-${r.resource}`}>
+            <Text dimColor={!r.isOwn}>{`${r.resource} `}</Text>
+            <Text color={r.held > 0 ? ACCENT : RULE}>{'●'.repeat(Math.min(r.held, r.max))}</Text>
+            <Text color={RULE}>{'○'.repeat(Math.max(0, r.max - r.held))}</Text>
+            {r.holders.length > 0 && <Text dimColor>{` ${r.holders.join(', ')}`}</Text>}
+            {r.queued > 0 && <Text color={WARN}>{` +${r.queued} en file`}</Text>}
+          </Text>
+        ))}
+      </Box>
+      {(model.held.length > 0 || model.queued.length > 0) && (
+        <Box flexWrap="wrap" columnGap={2}>
+          {model.held.map(s => (
+            <Button key={`release-${s.resource}-${s.label}`} label={`Libérer ${slotName(s)}`} variant="secondary" onPress={() => releaseFromBand($, s)} />
+          ))}
+          {model.queued.map(s => (
+            <Box key={`queued-${s.resource}-${s.label}`} columnGap={1}>
+              <Text color={WARN}>{`en file #${s.position} ${slotName(s)}`}</Text>
+              <Button key={`leave-${s.resource}-${s.label}`} label="Quitter la file" variant="secondary" onPress={() => releaseFromBand($, s)} />
+            </Box>
+          ))}
+        </Box>
+      )}
+      {below}
+    </Box>
+  )
+}
+
 export const register: Register = on => {
+  on('ui.render', { component: 'AbovePrompt' }, async ($, e, next) => {
+    const below = await next(e)
+    if (e.props.hasSurvey || (await read($, runBoardIsActive))) return below
+    const view = await read($, bandView)
+    const model = view && bandModelOf(view)
+    return model ? drawBand($, e, model, below) : below
+  })
+
   on('engine.create', async (_$, e, next) => {
     const built = await next(e)
     const ops: Ops = {
@@ -366,14 +449,19 @@ export const register: Register = on => {
       },
     })
     $.clock.every(ADMIT_MS, () => {
-      void sweep(o).catch(error => o.log(`machine-locks sweep: ${String(error)}`))
+      void sweep(o)
+        .then(() => refreshBand($, o))
+        .catch(error => o.log(`machine-locks sweep: ${String(error)}`))
     })
+    await refreshBand($, o).catch(error => o.log(`machine-locks band: ${String(error)}`))
     return started
   })
 
   on('tool.call', { tool: TOOL_ID }, async ($, e) => {
     const ownGrants: string[] = []
-    const reply = await respond({ ...opsOf($), ownGrants }, e as unknown as Input)
+    const o = { ...opsOf($), ownGrants }
+    const reply = await respond(o, e as unknown as Input)
+    await refreshBand($, o).catch(error => o.log(`machine-locks band: ${String(error)}`))
     return answer([reply, ...ownGrants].join('\n'))
   })
 

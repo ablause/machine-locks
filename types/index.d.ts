@@ -35,8 +35,15 @@ export type MachineLocks = {
   releaseSession: (session: string) => Promise<MachineLocksRelease[]>
 }
 
+/** What the band above the prompt draws: the table and the machine's room as this session last measured them. */
+export type MachineLocksBandView = { session: string; at: number; locks: MachineLocksTable; room: { memoryMb: number; cores: number } | null; totalMb: number | null }
+
 declare module 'claude-code' {
   interface EngineInterface {
     machineLocks: MachineLocks
+  }
+  interface PluginState {
+    'machine-locks': { band: MachineLocksBandView | null }
+    'run-board': { isActive: boolean }
   }
 }

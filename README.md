@@ -31,6 +31,11 @@ the slip, not a script that boots a device, and a guard that fails lets the comm
 Every change of the table holds `/tmp/claude-machine-locks.mutex`, made by `mkdir`, so two sessions that acquire at
 once never overwrite each other; one left by a session killed mid-change is taken over after ten seconds.
 
+A band above the prompt shows while this session holds or waits on a slot, or while sessions wait on the
+machine: the memory left for budgeted slots, each lock in use with its holders (this session's first, with how
+long it has held), this session's place in line, and buttons to release a slot or leave the line. It stays hidden
+in a coordinator session, whose run board draws the locks already.
+
 A slot is held by a session (its id, its name as `claude agents` lists it, and an optional label such as
 a task id). A session that exits (`/exit`, `/clear`, logout) frees its slots. A background session paused
 by its supervisor keeps them, since a message brings it back; a holder whose session is gone or failed is
