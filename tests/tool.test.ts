@@ -31,12 +31,27 @@ function machine(on: On, live: string[] = ['a', 'b', 'c'], sysctl?: { stdout: st
     prompts.push(e.text)
     return { text: e.text }
   })
+  // The mutex folder, as `mkdir`, `rmdir` and `stat -f %m` see it: the second it was made at, or absent.
+  const mutex: { madeAt?: number } = {}
+  const runs: string[] = []
   on('process.run', (_$, e) => {
+    runs.push(e.argv[0] ?? '')
+    const done = (exitCode: number, stdout = '') => ({ value: { exitCode, stdout, stderr: '', isStdoutTruncated: false, isStderrTruncated: false } })
+    if (e.argv[0] === 'mkdir') {
+      if (mutex.madeAt !== undefined) return done(1)
+      mutex.madeAt = Math.floor(clock.now() / 1000)
+      return done(0)
+    }
+    if (e.argv[0] === 'rmdir') {
+      if (mutex.madeAt === undefined) return done(1)
+      delete mutex.madeAt
+      return done(0)
+    }
+    if (e.argv[0] === 'stat') return mutex.madeAt === undefined ? done(1) : done(0, `${mutex.madeAt}\n`)
     const rows = live.map(s => ({ sessionId: s, name: `session-${s}`, state: 'working' }))
-    const stdout = e.argv[0] === 'claude' ? JSON.stringify(rows) : e.argv[0] === 'sysctl' ? (sysctl?.stdout ?? '') : (sysctl?.pressure ?? '')
-    return { value: { exitCode: 0, stdout, stderr: '', isStdoutTruncated: false, isStderrTruncated: false } }
+    return done(0, e.argv[0] === 'claude' ? JSON.stringify(rows) : e.argv[0] === 'sysctl' ? (sysctl?.stdout ?? '') : (sysctl?.pressure ?? ''))
   })
-  return { store, clock, sent, prompts, unreachable, as: (session: string) => void (me = session) }
+  return { store, clock, sent, prompts, unreachable, mutex, runs, as: (session: string) => void (me = session) }
 }
 
 const call = async ($: Engine, input: Record<string, unknown>) =>
@@ -141,4 +156,33 @@ test('a scaled lock is sized from the machine at define', async ($, on) => {
   machine(on, ['a'], { stdout: '{ 1.00 1.00 1.00 }\n10\n34359738368\n', pressure: 'System-wide memory free percentage: 50%' })
   await $.session.start({ cwd: '/w/a', surface: null, isInteractive: false })
   expect(await call($, { action: 'define', resource: 'simulator', capacity: 4, memoryGb: 4 })).toBe('simulator defined, scaled: capacity 2 of max 4')
+})
+
+test('every change of the table holds the machine mutex and frees it', async ($, on) => {
+  const m = machine(on)
+  await $.session.start({ cwd: '/w/a', surface: null, isInteractive: false })
+  await call($, { action: 'define', resource: 'simulator', capacity: 1 })
+  await call($, { action: 'acquire', resource: 'simulator' })
+  expect(m.runs.filter(r => r === 'mkdir' || r === 'rmdir')).toEqual(['mkdir', 'rmdir', 'mkdir', 'rmdir'])
+  expect(m.mutex.madeAt).toBeUndefined()
+})
+
+test('a mutex left by a session killed mid-change is taken over', async ($, on) => {
+  const m = machine(on)
+  await $.session.start({ cwd: '/w/a', surface: null, isInteractive: false })
+  m.mutex.madeAt = Math.floor(m.clock.now() / 1000) - 60
+  expect(await call($, { action: 'define', resource: 'simulator', capacity: 1 })).toBe('simulator defined, capacity 1')
+  expect(m.mutex.madeAt).toBeUndefined()
+})
+
+test('a change waits while another session holds the mutex', async ($, on) => {
+  const m = machine(on)
+  await $.session.start({ cwd: '/w/a', surface: null, isInteractive: false })
+  m.mutex.madeAt = Math.floor(m.clock.now() / 1000)
+  const defined = call($, { action: 'define', resource: 'simulator', capacity: 1 })
+  await m.clock.advance(100)
+  expect(m.store.get('locks')).toBeUndefined()
+  delete m.mutex.madeAt
+  await m.clock.advance(100)
+  expect(await defined).toBe('simulator defined, capacity 1')
 })

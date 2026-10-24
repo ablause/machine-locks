@@ -13,6 +13,7 @@ type Ops = {
   get: (key: string) => Promise<unknown>
   set: (key: string, value: unknown) => Promise<void>
   now: () => Promise<number>
+  sleep: (ms: number) => Promise<void>
   id: () => Promise<string>
   cwd: () => Promise<string>
   run: (argv: string[], timeoutMs: number) => Promise<Run>
@@ -27,6 +28,7 @@ const opsOf = ($: EngineInterface): Ops => ({
   get: key => $.store.get(key),
   set: (key, value) => $.store.set(key, value),
   now: () => $.clock.now(),
+  sleep: ms => $.clock.sleep(ms),
   id: () => $.session.id(),
   cwd: () => $.session.cwd(),
   run: (argv, timeoutMs) => $.process.run(argv, { timeoutMs }),
@@ -49,12 +51,51 @@ async function loadLocks(o: Ops): Promise<Locks> {
   return ((await o.get(LOCKS_KEY)) as Locks | undefined) ?? {}
 }
 
-// The shared table is reread right before every change and written right after, so another session's change
-// between two of ours is counted.
+/** A `mkdir` either creates the folder or fails, atomically: the claim every session of the machine takes before changing the table. */
+const MUTEX_DIR = '/tmp/claude-machine-locks.mutex'
+/** A change holds the mutex for milliseconds: one older than this was left by a session killed mid-change. */
+const MUTEX_STALE_MS = 10_000
+const MUTEX_WAIT_MS = 5_000
+
+const runOrNull = (o: Ops, argv: string[]) => o.run(argv, 2000).catch(() => null)
+
+async function isMutexStale(o: Ops): Promise<boolean> {
+  const stat = await runOrNull(o, ['stat', '-f', '%m', MUTEX_DIR])
+  if (!stat || stat.exitCode !== 0) return false
+  return (await o.now()) - Number(stat.stdout.trim()) * 1000 > MUTEX_STALE_MS
+}
+
+/** Runs `body` holding the machine's mutex; a mutex that cannot be taken never blocks the lock, it is only logged. */
+async function withMutex<T>(o: Ops, body: () => Promise<T>): Promise<T> {
+  const start = await o.now()
+  let isHeld = false
+  for (;;) {
+    const made = await runOrNull(o, ['mkdir', MUTEX_DIR])
+    if (!made) break
+    if (made.exitCode === 0) {
+      isHeld = true
+      break
+    }
+    if ((await o.now()) - start > MUTEX_WAIT_MS) break
+    if (await isMutexStale(o)) await runOrNull(o, ['rmdir', MUTEX_DIR])
+    else await o.sleep(20)
+  }
+  if (!isHeld) o.log(`machine-locks: ${MUTEX_DIR} not taken, the table changes without it`)
+  try {
+    return await body()
+  } finally {
+    if (isHeld) await runOrNull(o, ['rmdir', MUTEX_DIR])
+  }
+}
+
+// `$.store` has no compare-and-set across processes: without the mutex, two sessions that acquire at once both
+// read the same table and the last write drops the other's slot, which then believes it holds one.
 async function changeLocks<T extends { next: Locks }>(o: Ops, change: (all: Locks) => T): Promise<T> {
-  const result = change(await loadLocks(o))
-  await o.set(LOCKS_KEY, result.next)
-  return result
+  return withMutex(o, async () => {
+    const result = change(await loadLocks(o))
+    await o.set(LOCKS_KEY, result.next)
+    return result
+  })
 }
 
 async function agentRows(o: Ops): Promise<AgentRow[] | null> {
@@ -271,6 +312,7 @@ export const register: Register = on => {
       get: key => built.store.get(key),
       set: (key, value) => built.store.set(key, value),
       now: () => built.clock.now(),
+      sleep: ms => built.clock.sleep(ms),
       id: () => built.session.id(),
       cwd: () => built.session.cwd(),
       run: (argv, timeoutMs) => built.process.run(argv, { timeoutMs }),
