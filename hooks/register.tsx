@@ -1,9 +1,10 @@
 import { atom, read, update } from 'claude-code'
-import type { EngineInterface, Register, RenderChildren } from 'claude-code'
+import type { EngineInterface, Register } from 'claude-code'
 import type { MachineLocks, MachineLocksGuard as Guard, MachineLocksHold as Hold, MachineLocksHolder as Holder, MachineLocksRelease as Release, MachineLocksTable as Locks } from '../types'
 import { acquireIn, admitIn, budgetOf, budgetQueueOf, deadHoldersOf, defineIn, guardVerdictOf, historyStatsOf, historyWith, liveSessionsOf, LOCKS_KEY, longHeldOf, nameOf, releaseIn, removeIn, roomOf } from './table'
 import type { AgentRow, Budget } from './table'
 import { bandModelOf } from './band'
+import { stackBands } from './bands'
 import type { BandModel, BandView, Slot } from './band'
 
 const bandView = atom({ plugin: 'machine-locks', key: 'band' } as const, null as BandView | null)
@@ -348,12 +349,12 @@ async function releaseFromBand($: EngineInterface, slot: Slot): Promise<void> {
   await refreshBand($, o)
 }
 
-/** One line for the machine and the locks in use, then this session's buttons, above the engine's own band. */
-function drawBand($: EngineInterface, e: RenderEvent, model: BandModel, below: RenderChildren) {
+/** One line for the machine and the locks in use, then this session's buttons. */
+function drawBand($: EngineInterface, e: RenderEvent, model: BandModel) {
   const { Box, Button, Text } = $.ui.resolve(e)
   const filled = Math.round(model.gauge ? model.gauge.share * GAUGE_CELLS : 0)
   return (
-    <Box key="machine-locks-band" flexDirection="column">
+    <Box flexDirection="column">
       <Box flexWrap="wrap" columnGap={3}>
         <Text dimColor>verrous</Text>
         {model.gauge && (
@@ -387,7 +388,6 @@ function drawBand($: EngineInterface, e: RenderEvent, model: BandModel, below: R
           ))}
         </Box>
       )}
-      {below}
     </Box>
   )
 }
@@ -398,7 +398,7 @@ export const register: Register = on => {
     if (e.props.hasSurvey) return below
     const view = await read($, bandView)
     const model = view && bandModelOf(view)
-    return model ? drawBand($, e, model, below) : below
+    return model ? stackBands(below, 'machine-locks', drawBand($, e, model)) : below
   })
 
   on('engine.create', async (_$, e, next) => {
