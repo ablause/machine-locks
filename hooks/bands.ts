@@ -6,7 +6,7 @@
 import type { RenderElement, RenderNode } from 'claude-code'
 
 /** Top to bottom: the last sits right above the prompt. One blank line separates two bands, none sits inside one. */
-export const ORDER = ['machine-locks', 'clickup-flow', 'review-nudge', 'voir', 'attente', 'where-we-are']
+export const ORDER = ['machine-locks', 'clickup-flow', 'pr-lifecycle', 'review-nudge', 'voir', 'attente', 'where-we-are']
 
 const COLUMN = 'bands'
 const PREFIX = 'band:'
