@@ -36,7 +36,9 @@ machine: the memory left for budgeted slots, each lock in use with its holders (
 long it has held), this session's place in line, and buttons to release a slot or leave the line.
 
 A slot is held by a session (its id, its name as `claude agents` lists it, and an optional label such as
-a task id). A session that exits (`/exit`, `/clear`, logout) frees its slots. A background session paused
+a task id). The subagents of a session share its id: a slot one of them takes is labelled by its own loop
+when it gives no label, the GRANTED for it goes to that loop, and a guarded command passes only for the
+loop that holds the slot and the subagents it spawned. A session that exits (`/exit`, `/clear`, logout) frees its slots. A background session paused
 by its supervisor keeps them, since a message brings it back; a holder whose session is gone or failed is
 freed by the sweep as soon as someone waits on its lock, and a GRANTED that reaches nobody passes the slot
 on. A session that has held a slot for 45 minutes is asked, once per hold, whether it still needs it.

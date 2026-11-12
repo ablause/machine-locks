@@ -25,10 +25,14 @@ type Ops = {
   cwd: () => Promise<string>
   run: (argv: string[], timeoutMs: number) => Promise<Run>
   send: (sessionId: string, text: string) => Promise<boolean>
+  /** Reaches one subagent of this session, which a message to the session itself would not. */
+  sendAgent: (agentId: string, text: string) => Promise<boolean>
   submit: (text: string) => Promise<unknown>
   log: (text: string) => void
   /** Set inside a tool.call hook, where a prompt.submit would wait on the very turn the hook holds: grants to this session land here and go out in the tool's answer. */
   ownGrants?: string[]
+  /** The subagent loop the tool call runs in, absent on the main loop: workers of one session are told apart by it. */
+  agent?: string
 }
 
 const opsOf = ($: EngineInterface): Ops => ({
@@ -40,6 +44,7 @@ const opsOf = ($: EngineInterface): Ops => ({
   cwd: () => $.session.cwd(),
   run: (argv, timeoutMs) => $.process.run(argv, { timeoutMs }),
   send: async (sessionId, text) => (await $.session.send({ to: { sessionId }, text })).isDelivered,
+  sendAgent: async (agentId, text) => (await $.session.send({ to: { agentId }, text })).isDelivered,
   submit: text => $.prompt.submit({ text }),
   log: text => $.ui.log(text, { to: 'debug' }),
 })
@@ -133,15 +138,23 @@ async function selfName(o: Ops): Promise<string> {
 const grantText = (resource: string, h: Holder) =>
   `GRANTED ${resource}${h.label ? ` ${h.label}` : ''}: the slot you queued for is yours now. Release it through ${TOOL_ID} as soon as you are done with it.`
 
-/** Tells the session it now holds the slot; false when it cannot be reached. */
+/**
+ * Tells the holder it now has the slot; false when it cannot be reached. A slot taken from a subagent
+ * loop belongs to that loop: only its own session can message it, and another session's grant reaches
+ * the session, whose main loop passes it on by its label.
+ */
 async function notify(o: Ops, resource: string, h: Holder): Promise<boolean> {
-  if (h.session === (await o.id())) {
-    if (o.ownGrants) o.ownGrants.push(grantText(resource, h))
-    else await o.submit(`[machine-locks] ${grantText(resource, h)}`)
-    return true
-  }
+  const text = grantText(resource, h)
   try {
-    return await o.send(h.session, grantText(resource, h))
+    if (h.session !== (await o.id())) return await o.send(h.session, text)
+    if ((h.agent ?? '') === (o.agent ?? '')) {
+      if (o.ownGrants) o.ownGrants.push(text)
+      else await o.submit(`[machine-locks] ${text}`)
+      return true
+    }
+    if (h.agent) return await o.sendAgent(h.agent, text)
+    await o.submit(`[machine-locks] ${text}`)
+    return true
   } catch {
     return false
   }
@@ -272,6 +285,14 @@ async function sweep(o: Ops): Promise<void> {
 
 const answer = (text: string) => ({ result: text }) as never
 
+/** A subagent loop and every loop above it: a worker holds the slot its own verification subagent uses. */
+async function lineageOf($: EngineInterface, agentId: string): Promise<string[]> {
+  const parents = new Map((await $.agent.list().catch(() => [])).map(a => [a.id, a.parentId] as const))
+  const lineage = [agentId]
+  for (let id = parents.get(agentId); id !== undefined && lineage.length < 8; id = parents.get(id)) lineage.push(id)
+  return lineage
+}
+
 type Input = { action?: string; resource?: string; capacity?: number; memoryGb?: number; cores?: number; label?: string; holder?: string; guard?: Guard }
 
 async function define(o: Ops, resource: string, input: Input): Promise<string> {
@@ -287,7 +308,7 @@ async function define(o: Ops, resource: string, input: Input): Promise<string> {
 }
 
 async function acquire(o: Ops, resource: string, label: string): Promise<string> {
-  const holder: Holder = { session: await o.id(), name: await selfName(o), ...(label ? { label } : {}), since: await o.now() }
+  const holder: Holder = { session: await o.id(), name: await selfName(o), ...(label ? { label } : {}), ...(o.agent ? { agent: o.agent } : {}), since: await o.now() }
   const queued = await changeLocks(o, all => acquireIn(all, resource, holder))
   let { outcome, ahead } = queued
   if (outcome === 'queued' && queued.next[resource]?.scale) {
@@ -412,6 +433,7 @@ export const register: Register = on => {
       cwd: () => built.session.cwd(),
       run: (argv, timeoutMs) => built.process.run(argv, { timeoutMs }),
       send: async (sessionId, text) => (await built.session.send({ to: { sessionId }, text })).isDelivered,
+      sendAgent: async (agentId, text) => (await built.session.send({ to: { agentId }, text })).isDelivered,
       submit: text => built.prompt.submit({ text }),
       log: text => built.ui.log(text, { to: 'debug' }),
     }
@@ -457,8 +479,10 @@ export const register: Register = on => {
 
   on('tool.call', { tool: TOOL_ID }, async ($, e) => {
     const ownGrants: string[] = []
-    const o = { ...opsOf($), ownGrants }
-    const reply = await respond(o, e as unknown as Input)
+    const input = e as unknown as Input
+    // Every subagent of a session shares its id: a slot taken with no label is labelled by its loop, never the session's.
+    const o = { ...opsOf($), ownGrants, ...(e.agentId ? { agent: e.agentId } : {}) }
+    const reply = await respond(o, e.agentId && !input.label ? { ...input, label: e.agentId } : input)
     await refreshBand($, o).catch(error => o.log(`machine-locks band: ${String(error)}`))
     return answer([reply, ...ownGrants].join('\n'))
   })
@@ -467,7 +491,7 @@ export const register: Register = on => {
   on('tool.call', { tool: 'Bash' }, async ($, e, next) => {
     const command = (e as unknown as { command?: unknown }).command
     if (typeof command !== 'string') return next(e)
-    const reason = guardVerdictOf(await loadLocks(opsOf($)), command, await $.session.id(), TOOL_ID)
+    const reason = guardVerdictOf(await loadLocks(opsOf($)), command, await $.session.id(), TOOL_ID, e.agentId ? await lineageOf($, e.agentId) : undefined)
     return reason ? { deny: reason } : next(e)
   })
 

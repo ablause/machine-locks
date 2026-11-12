@@ -226,15 +226,20 @@ const matchOf = (sources: readonly string[] | undefined, command: string): strin
   return null
 }
 
-/** Why `command` may not run in `session`, or null: a forbidden command first, then a guarded one without a held slot. */
-export function guardVerdictOf(all: Locks, command: string, session: string, tool: string): string | null {
+/**
+ * Why `command` may not run in `session`, or null: a forbidden command first, then a guarded one without a held slot.
+ * From a subagent loop, `lineage` names that loop and the loops above it: a slot another worker of the same session
+ * took is not this one's, while one its own worker or the main loop took is.
+ */
+export function guardVerdictOf(all: Locks, command: string, session: string, tool: string, lineage?: readonly string[]): string | null {
+  const isOwn = (h: Holder) => h.session === session && (lineage === undefined || h.agent === undefined || lineage.includes(h.agent))
   for (const [resource, lock] of Object.entries(all)) {
     const guard = lock.guard ?? KNOWN_GUARDS[resource]
     const forbidden = matchOf(guard?.forbid, command)
     if (forbidden) return `machine-locks: "${forbidden}" acts on every session's ${resource} at once. Target your own instance by its id instead.`
     const needed = matchOf(guard?.needs, command)
-    if (needed && !lock.holders.some(h => h.session === session)) {
-      const waiting = lock.queue.some(h => h.session === session)
+    if (needed && !lock.holders.some(isOwn)) {
+      const waiting = lock.queue.some(isOwn)
       return waiting
         ? `machine-locks: "${needed}" needs a ${resource} slot and this session is still queued for one. End the turn on "Waiting on ${resource}": a GRANTED message wakes you.`
         : `machine-locks: "${needed}" needs a ${resource} slot. Take one first through ${tool} (action acquire, resource ${resource}, your task as label), then run it again.`

@@ -222,3 +222,17 @@ test('history reports what the released slots waited and held', async ($, on) =>
   await call($, { action: 'release', resource: 'simulator' })
   expect(JSON.parse(await call($, { action: 'history' })).simulator).toMatchObject({ holds: 2, queued: 1, waitMinutes: { p90: 5 }, holdMinutes: { p50: 10 } })
 })
+
+test('two worker subagents of one session are two holders: the second queues, and its GRANTED goes to its own loop', async ($, on) => {
+  const m = machine(on)
+  await $.session.start({ cwd: '/w/a', surface: null, isInteractive: false })
+  expect(await call($, { action: 'define', resource: 'simulator', capacity: 1 })).toBe('simulator defined, capacity 1')
+  expect(await call($, { action: 'acquire', resource: 'simulator', agentId: 'w1' })).toContain('simulator granted')
+  expect(await call($, { action: 'acquire', resource: 'simulator', label: 'T2', agentId: 'w2' })).toContain('queued, 0 ahead')
+  expect(await call($, { action: 'release', resource: 'simulator', agentId: 'w2' })).toBe('simulator: no slot of this session to release')
+  const released = await call($, { action: 'release', resource: 'simulator', agentId: 'w1' })
+  expect(released).toBe('simulator released, granted to session-a (T2)')
+  expect(m.sent).toHaveLength(1)
+  expect(m.sent[0]?.to).toContain('w2')
+  expect(m.sent[0]?.text).toStartWith('GRANTED simulator T2:')
+})

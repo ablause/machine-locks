@@ -167,3 +167,13 @@ test('history stats count the queued holds and read wait and hold in minutes', (
     simulator: { holds: 3, queued: 1, waitMinutes: { p50: 0, p90: 2 }, holdMinutes: { p50: 20, p90: 30 }, since: 0 },
   })
 })
+
+test('a worker subagent needs the slot its own lineage took, never one another worker of the session holds', () => {
+  const table = { 'ios-simulator': { capacity: 2, holders: [{ session: 'a', name: 'session-a', label: 'T1', agent: 'w1' }], queue: [{ session: 'a', name: 'session-a', label: 'T2', agent: 'w2' }] } }
+  const boot = 'xcrun simctl boot 1234'
+  expect(guardVerdictOf(table, boot, 'a', 'locks', ['w1'])).toBeNull()
+  expect(guardVerdictOf(table, boot, 'a', 'locks', ['verify-1', 'w1'])).toBeNull()
+  expect(guardVerdictOf(table, boot, 'a', 'locks', ['w2'])).toContain('still queued')
+  expect(guardVerdictOf(table, boot, 'a', 'locks', ['w3'])).toContain('needs a ios-simulator slot. Take one first')
+  expect(guardVerdictOf(table, boot, 'a', 'locks')).toBeNull()
+})
