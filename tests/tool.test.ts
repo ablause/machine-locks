@@ -7,7 +7,14 @@ const TOOL = 'mcp__machine-locks__locks'
 /** Two sessions of one machine: they share the store, and `as` switches which one is calling. */
 function machine(on: On, live: string[] = ['a', 'b', 'c'], sysctl?: { stdout: string; pressure: string }) {
   const store = new Map<string, unknown>()
-  on('store.get', (_$, e) => ({ value: store.get(e.key) }))
+  const outage = { reads: 0 }
+  on('store.get', (_$, e) => {
+    if (outage.reads > 0) {
+      outage.reads--
+      throw new Error('store unavailable')
+    }
+    return { value: store.get(e.key) }
+  })
   on('store.set', (_$, e) => {
     store.set(e.key, e.value)
     return { value: undefined }
@@ -51,7 +58,7 @@ function machine(on: On, live: string[] = ['a', 'b', 'c'], sysctl?: { stdout: st
     const rows = live.map(s => ({ sessionId: s, name: `session-${s}`, state: 'working' }))
     return done(0, e.argv[0] === 'claude' ? JSON.stringify(rows) : e.argv[0] === 'sysctl' ? (sysctl?.stdout ?? '') : (sysctl?.pressure ?? ''))
   })
-  return { store, clock, sent, prompts, unreachable, mutex, runs, as: (session: string) => void (me = session) }
+  return { store, clock, sent, prompts, unreachable, mutex, runs, outage, as: (session: string) => void (me = session) }
 }
 
 const call = async ($: Engine, input: Record<string, unknown>) =>
@@ -235,4 +242,23 @@ test('two worker subagents of one session are two holders: the second queues, an
   expect(m.sent).toHaveLength(1)
   expect(m.sent[0]?.to).toContain('w2')
   expect(m.sent[0]?.text).toStartWith('GRANTED simulator T2:')
+})
+
+test('a call whose first try fails is answered on the second, and says what failed', async ($, on) => {
+  const m = machine(on)
+  await $.session.start({ cwd: '/w/a', surface: null, isInteractive: false })
+  await call($, { action: 'define', resource: 'db', capacity: 1 })
+  await call($, { action: 'acquire', resource: 'db', label: 'T1' })
+  m.outage.reads = 1
+  const released = await call($, { action: 'release', resource: 'db', label: 'T1' })
+  expect(released).toContain('db released')
+  expect(released).toContain('answered on its second try; the first failed, throw')
+})
+
+test('a call that fails twice still answers, naming the failure', async ($, on) => {
+  const m = machine(on)
+  await $.session.start({ cwd: '/w/a', surface: null, isInteractive: false })
+  m.outage.reads = 50
+  const listed = await call($, { action: 'list' })
+  expect(listed).toContain('machine-locks could not answer, twice (throw')
 })

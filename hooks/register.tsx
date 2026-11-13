@@ -413,6 +413,17 @@ function drawBand($: EngineInterface, e: RenderEvent, model: BandModel) {
   )
 }
 
+/** The tool's answer to one call, from whichever loop made it. */
+async function answerCall($: EngineInterface, e: { agentId?: string }): Promise<string> {
+  const ownGrants: string[] = []
+  const input = e as unknown as Input
+  // Every subagent of a session shares its id: a slot taken with no label is labelled by its loop, never the session's.
+  const o = { ...opsOf($), ownGrants, ...(e.agentId ? { agent: e.agentId } : {}) }
+  const reply = await respond(o, e.agentId && !input.label ? { ...input, label: e.agentId } : input)
+  await refreshBand($, o).catch(error => o.log(`machine-locks band: ${String(error)}`))
+  return [reply, ...ownGrants].join('\n')
+}
+
 export const register: Register = on => {
   on('ui.render', { component: 'AbovePrompt' }, async ($, e, next) => {
     const below = await next(e)
@@ -477,14 +488,15 @@ export const register: Register = on => {
     return started
   })
 
-  on('tool.call', { tool: TOOL_ID }, async ($, e) => {
-    const ownGrants: string[] = []
-    const input = e as unknown as Input
-    // Every subagent of a session shares its id: a slot taken with no label is labelled by its loop, never the session's.
-    const o = { ...opsOf($), ownGrants, ...(e.agentId ? { agent: e.agentId } : {}) }
-    const reply = await respond(o, e.agentId && !input.label ? { ...input, label: e.agentId } : input)
-    await refreshBand($, o).catch(error => o.log(`machine-locks band: ${String(error)}`))
-    return answer([reply, ...ownGrants].join('\n'))
+  // A failed hook is absent, and the call then reads as a tool nobody answers. Every action is safe to
+  // ask twice, so the call is tried again, and what failed is said in the answer either way.
+  on('tool.call', { tool: TOOL_ID }, async ($, e) => answer(await answerCall($, e))).catch(async ($, e, next) => {
+    const failed = `${next.error.kind}${next.error.message ? `: ${next.error.message}` : ''}`
+    try {
+      return answer(`${await answerCall($, e)}\n(machine-locks answered on its second try; the first failed, ${failed})`)
+    } catch (error) {
+      return answer(`machine-locks could not answer, twice (${failed}; then ${String(error)}). The table may not have changed: call "list" to read it, then ask again.`)
+    }
   })
 
   // Matching the command text, not what it runs: a script that boots a device passes, this only stops the slip.
