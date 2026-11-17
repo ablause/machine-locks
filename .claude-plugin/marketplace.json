@@ -1,0 +1,11 @@
+{
+  "name": "machine-locks",
+  "owner": { "name": "Alexandre Blause" },
+  "plugins": [
+    {
+      "name": "machine-locks",
+      "source": "./",
+      "description": "Machine-wide locks on exclusive resources (a simulator, a local database, fixed ports, build capacity) that Claude Code sessions queue for, the next in line told GRANTED directly"
+    }
+  ]
+}
