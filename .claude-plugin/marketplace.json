@@ -1,6 +1,9 @@
 {
   "name": "machine-locks",
-  "owner": { "name": "Alexandre Blause" },
+  "owner": {
+    "name": "Alexandre Blause"
+  },
+  "description": "Machine-wide locks that Claude Code sessions queue for",
   "plugins": [
     {
       "name": "machine-locks",
