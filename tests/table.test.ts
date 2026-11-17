@@ -1,6 +1,6 @@
 import { expect, test } from 'claude-code/testing'
 
-import { acquireIn, admitIn, budgetOf, deadHoldersOf, defineIn, guardVerdictOf, historyStatsOf, historyWith, HISTORY_SIZE, liveSessionsOf, longHeldOf, LONG_HOLD_MS, releaseIn, removeIn, roomOf } from '../hooks/table'
+import { acquireIn, admitIn, budgetOf, linuxBudgetOf, deadHoldersOf, defineIn, guardVerdictOf, historyStatsOf, historyWith, HISTORY_SIZE, liveSessionsOf, longHeldOf, LONG_HOLD_MS, releaseIn, removeIn, roomOf } from '../hooks/table'
 
 const one = { simulator: { capacity: 1, holders: [], queue: [] } }
 const a = { session: 'a', name: 'alpha', since: 0 }
@@ -90,6 +90,12 @@ test('a waiter whose own lock is at its max is passed, and without a measure onl
 test('the machine budget is read from sysctl and memory_pressure', () => {
   expect(budgetOf('{ 2.50 2.00 1.00 }\n10\n34359738368\n', 'System-wide memory free percentage: 40%')).toEqual({ totalMb: 32_768, freeMb: 13_107.2, load: 2.5, cores: 10 })
   expect(budgetOf('', '')).toBeNull()
+})
+
+test('the machine budget is read from /proc on Linux', () => {
+  const meminfo = 'MemTotal:       32768000 kB\nMemFree:         1000000 kB\nMemAvailable:   16384000 kB\n'
+  expect(linuxBudgetOf('2.50 2.00 1.00 3/900 12345\n', '8\n', meminfo)).toEqual({ totalMb: 32_000, freeMb: 16_000, load: 2.5, cores: 8 })
+  expect(linuxBudgetOf('', '', '')).toBeNull()
 })
 
 test('a long hold is reported once, to its own session only', () => {

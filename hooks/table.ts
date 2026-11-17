@@ -165,6 +165,17 @@ export function budgetOf(sysctl: string, pressure: string): Budget | null {
   return { totalMb, freeMb: (totalMb * Number(freeShare[1])) / 100, load, cores }
 }
 
+/** `/proc/loadavg`, `nproc` and `/proc/meminfo` on Linux, read as what the machine has left. */
+export function linuxBudgetOf(loadavg: string, nproc: string, meminfo: string): Budget | null {
+  const kbOf = (field: string) => Number(meminfo.match(new RegExp(`^${field}:\\s*(\\d+)\\s*kB`, 'm'))?.[1] ?? NaN)
+  const totalMb = kbOf('MemTotal') / 1024
+  const freeMb = kbOf('MemAvailable') / 1024
+  const load = Number(loadavg.trim().split(/\s+/)[0])
+  const cores = Number(nproc.trim())
+  if (![totalMb, freeMb, load, cores].every(Number.isFinite) || cores === 0 || loadavg.trim() === '') return null
+  return { totalMb, freeMb, load, cores }
+}
+
 export const LONG_HOLD_MS = 45 * 60_000
 
 const spentOf = (ms: number) => {
@@ -202,7 +213,7 @@ export function deadHoldersOf(all: Locks, live: ReadonlySet<string>): { resource
 
 const DEVICE_SCRIPT = String.raw`(?:scripts/device|\$D|\bdevice)\s+up\s+`
 
-/** What the mobile-devices skill's two resources watch when their lock was defined without a guard of its own. */
+/** What `ios-simulator` and `android-emulator` watch when defined without a guard of their own: the simctl and emulator CLIs, and agent-device's `device up`. */
 export const KNOWN_GUARDS: Record<string, Guard> = {
   'ios-simulator': {
     needs: [`${DEVICE_SCRIPT}ios\\b`, String.raw`\bsimctl\s+(?:boot|create|clone)\b`],

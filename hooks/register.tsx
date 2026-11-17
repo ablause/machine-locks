@@ -1,7 +1,7 @@
 import { atom, read, update } from 'claude-code'
 import type { EngineInterface, Register } from 'claude-code'
 import type { MachineLocks, MachineLocksGuard as Guard, MachineLocksHold as Hold, MachineLocksHolder as Holder, MachineLocksRelease as Release, MachineLocksTable as Locks } from '../types'
-import { acquireIn, admitIn, budgetOf, budgetQueueOf, deadHoldersOf, defineIn, guardVerdictOf, historyStatsOf, historyWith, liveSessionsOf, LOCKS_KEY, longHeldOf, nameOf, releaseIn, removeIn, roomOf } from './table'
+import { acquireIn, admitIn, budgetOf, linuxBudgetOf, budgetQueueOf, deadHoldersOf, defineIn, guardVerdictOf, historyStatsOf, historyWith, liveSessionsOf, LOCKS_KEY, longHeldOf, nameOf, releaseIn, removeIn, roomOf } from './table'
 import type { AgentRow, Budget } from './table'
 import { bandModelOf } from './band'
 import { stackBands } from './bands'
@@ -61,7 +61,7 @@ const HISTORY_KEY = 'history'
 
 const DESCRIPTION = `Exclusive resources shared by every Claude session on this machine (a simulator or device, a local database, fixed ports, build capacity), so two sessions never use one at once.
 Actions: "list" (every resource with its capacity, holders and queue); "history" (per resource, how often a slot was queued for and how long slots waited and were held: what to size a capacity or memoryGb on); "define" (resource, capacity; add memoryGb and/or cores, what one slot uses, and the resource draws on the machine's memory and cores, shared with every other resource defined so, capacity becoming its own max; add guard to have Bash refuse the commands that need a slot of it, or that act on every session's instance at once); "acquire" (resource, label: answers granted, or queued with how many are ahead; when queued, do not touch the resource and end your turn on "Waiting on <resource> for <label>": a GRANTED <resource> message wakes you once a slot frees); "release" (resource, label: frees your slot as soon as you are done, and the next session in line is told); "remove" (resource, refused while another session holds or waits on it).
-"label" says what the slot is for, your task id in a coordinator run; a second slot of the same resource takes another label (T2#2). Every slot of this session is freed when it exits.`
+"label" says what the slot is for, such as a task id; a second slot of the same resource takes another label (T2#2). Every slot of this session is freed when it exits.`
 
 async function loadLocks(o: Ops): Promise<Locks> {
   return ((await o.get(LOCKS_KEY)) as Locks | undefined) ?? {}
@@ -76,7 +76,9 @@ const MUTEX_WAIT_MS = 5_000
 const runOrNull = (o: Ops, argv: string[]) => o.run(argv, 2000).catch(() => null)
 
 async function isMutexStale(o: Ops): Promise<boolean> {
-  const stat = await runOrNull(o, ['stat', '-f', '%m', MUTEX_DIR])
+  // BSD stat first, GNU stat when it fails.
+  let stat = await runOrNull(o, ['stat', '-f', '%m', MUTEX_DIR])
+  if (!stat || stat.exitCode !== 0 || !/^\d+$/.test(stat.stdout.trim())) stat = await runOrNull(o, ['stat', '-c', '%Y', MUTEX_DIR])
   if (!stat || stat.exitCode !== 0) return false
   return (await o.now()) - Number(stat.stdout.trim()) * 1000 > MUTEX_STALE_MS
 }
@@ -228,8 +230,10 @@ const apiOf = (o: Ops): MachineLocks => ({
 async function machineBudget(o: Ops): Promise<Budget | null> {
   const sys = await runOrNull(o, ['sysctl', '-n', 'vm.loadavg', 'hw.ncpu', 'hw.memsize'])
   const pressure = await runOrNull(o, ['memory_pressure', '-Q'])
-  if (sys?.exitCode !== 0 || pressure?.exitCode !== 0) return null
-  return budgetOf(sys.stdout, pressure.stdout)
+  if (sys?.exitCode === 0 && pressure?.exitCode === 0) return budgetOf(sys.stdout, pressure.stdout)
+  const [loadavg, nproc, meminfo] = await Promise.all([runOrNull(o, ['cat', '/proc/loadavg']), runOrNull(o, ['nproc']), runOrNull(o, ['cat', '/proc/meminfo'])])
+  if (loadavg?.exitCode !== 0 || nproc?.exitCode !== 0 || meminfo?.exitCode !== 0) return null
+  return linuxBudgetOf(loadavg.stdout, nproc.stdout, meminfo.stdout)
 }
 
 /** A holder whose session is gone never releases: when someone waits on its lock, its slot goes to the next in line. */
@@ -465,7 +469,7 @@ export const register: Register = on => {
           capacity: { type: 'number' },
           memoryGb: { type: 'number', description: 'define: the memory one slot uses, device and dev server included' },
           cores: { type: 'number', description: 'define: the cores one slot uses' },
-          label: { type: 'string', description: 'acquire, release: what the slot is for, your task id in a coordinator run' },
+          label: { type: 'string', description: 'acquire, release: what the slot is for, such as a task id' },
           holder: { type: 'string', description: 'release: the session id or name of a session that is gone, to free its slot' },
           guard: {
             type: 'object',
