@@ -1,6 +1,6 @@
 import { basename } from 'node:path'
 import { createInterface } from 'node:readline'
-import { INPUT_SCHEMA, releaseSession, respond } from '../hooks/engine'
+import { claudeAgentsVia, INPUT_SCHEMA, releaseSession, respond } from '../hooks/engine'
 import type { Input, Ops } from '../hooks/engine'
 import { CODEX_TOOL, codexPidOf, nodeFiles, run, sessionOf } from './node'
 
@@ -30,6 +30,8 @@ const ops: Ops = {
   tool: CODEX_TOOL,
   pid,
   waitMs: WAIT_MS,
+  // Where the claude CLI is installed, a Claude holder whose session is gone is freed from here too: otherwise only a waiting Claude session would.
+  agents: () => claudeAgentsVia(run),
 }
 
 type Message = { jsonrpc: '2.0'; id?: number | string; method?: string; params?: Record<string, unknown> }
