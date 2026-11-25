@@ -1,8 +1,11 @@
 /**
  * A session holding or waiting on one slot. `label` tells two slots of one session apart (`T2#2`) and says what it is for.
  * `since` is when it queued, then when it was granted; `waitedMs` how long it queued before that.
+ * `pid` marks a Codex session, known by its `codex` process: it is alive while that process runs, and it reads its
+ * grant from the table instead of being sent one. `untold` marks a Claude session granted from Codex, which cannot
+ * message it: that session's own sweep tells it.
  */
-export type MachineLocksHolder = { session: string; name: string; label?: string; since?: number; waitedMs?: number; agent?: string }
+export type MachineLocksHolder = { session: string; name: string; label?: string; since?: number; waitedMs?: number; agent?: string; pid?: number; untold?: boolean }
 
 /** One slot from its grant to its release, kept to size capacities on what the machine went through. */
 export type MachineLocksHold = { resource: string; name: string; label?: string; releasedAt: number; heldMs: number; waitedMs: number }

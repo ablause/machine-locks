@@ -49,20 +49,33 @@ test('the band draws above the prompt and its button frees the slot', async ($, 
     store.set(e.key, e.value)
     return { value: undefined }
   })
+  const files = new Map<string, string>()
+  on('fs.exists', (_$, e) => ({ value: files.has(e.path) }))
+  on('fs.read', (_$, e) => ({ value: files.get(e.path) ?? '' }))
+  on('fs.write', (_$, e) => {
+    files.set(e.path, e.text)
+    return { value: undefined }
+  })
   on('clock.now', () => ({ value: 1_000_000 }))
   on('session.id', () => ({ value: 'a' }))
   on('session.cwd', () => ({ value: '/w/a' }))
   on('session.start', (_$, e) => ({ cwd: e.cwd }))
   on('tool.register', (_$, e) => ({ value: { tool: e.name } }))
   on('ui.log', () => ({ value: undefined }))
-  on('process.run', (_$, e) => ({ value: { exitCode: e.argv[0] === 'claude' ? 1 : 0, stdout: '', stderr: '', isStdoutTruncated: false, isStderrTruncated: false } }))
+  on('process.run', (_$, e) => {
+    if (e.argv[0] === 'mv') {
+      files.set(e.argv[3] ?? '', files.get(e.argv[2] ?? '') ?? '')
+      files.delete(e.argv[2] ?? '')
+    }
+    return { value: { exitCode: e.argv[0] === 'claude' ? 1 : 0, stdout: e.argv[0] === '/bin/sh' ? '\n/h' : '', stderr: '', isStdoutTruncated: false, isStderrTruncated: false } }
+  })
   await $.session.start({ cwd: '/w/a', surface: null, isInteractive: false })
   await $.tool.call({ tool: TOOL, action: 'define', resource: 'db', capacity: 1 } as never)
   await $.tool.call({ tool: TOOL, action: 'acquire', resource: 'db', label: 'T1' } as never)
   const band = await $.ui.mount({ plugin: 'machine-locks', surface: 'terminal', component: 'AbovePrompt', props: { hasSurvey: false, isWorking: false, maxRows: 40, bodyColumns: 90 } } as never)
   expect(await band.find({ type: 'Box', key: 'engine-band' })).toBeDefined()
   await band.press({ key: 'release-db-T1' })
-  expect((store.get('locks') as Record<string, { holders: unknown[] }>).db?.holders).toEqual([])
+  expect((JSON.parse(files.get('/h/.local/state/machine-locks/locks.json') ?? '{}') as Record<string, { holders: unknown[] }>).db?.holders).toEqual([])
   expect(await band.find({ type: 'Button', key: 'release-db-T1' })).toBeUndefined()
   await band.unmount()
 })

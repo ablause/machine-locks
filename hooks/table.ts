@@ -206,10 +206,32 @@ export type AgentRow = { sessionId?: string; name?: string; state?: string | nul
 /** A failed background session never runs again on its own; a paused one comes back on a message, so it still holds. */
 export const liveSessionsOf = (rows: readonly AgentRow[]) => new Set(rows.filter(r => r.sessionId && r.state !== 'failed').map(r => r.sessionId as string))
 
-/** The holders of a lock someone waits on whose session is gone: nobody would ever release their slot. */
-export function deadHoldersOf(all: Locks, live: ReadonlySet<string>): { resource: string; holder: Holder }[] {
-  return Object.entries(all).flatMap(([resource, lock]) => (lock.queue.length === 0 ? [] : lock.holders.filter(h => !live.has(h.session)).map(holder => ({ resource, holder }))))
+/**
+ * The holders of a lock someone waits on whose session is gone: nobody would ever release their slot. A Codex holder
+ * is gone when its process is; a Claude one when `claude agents` no longer lists it, and never when that list is
+ * unknown (`live` null), as it is from Codex.
+ */
+export function deadHoldersOf(all: Locks, live: ReadonlySet<string> | null, alivePids: ReadonlySet<number> = new Set()): { resource: string; holder: Holder }[] {
+  const isGone = (h: Holder) => (h.pid !== undefined ? !alivePids.has(h.pid) : live !== null && !live.has(h.session))
+  return Object.entries(all).flatMap(([resource, lock]) => (lock.queue.length === 0 ? [] : lock.holders.filter(isGone).map(holder => ({ resource, holder }))))
 }
+
+/** Every Codex process that holds or waits on a slot. */
+export const holderPidsOf = (all: Locks): number[] => [...new Set(Object.values(all).flatMap(l => [...l.holders, ...l.queue].flatMap(h => (h.pid === undefined ? [] : [h.pid]))))]
+
+/** `ps -o pid= -p <pids>`, read as the pids still running. */
+export const alivePidsOf = (ps: string): Set<number> => new Set(ps.split('\n').map(line => Number(line.trim())).filter(pid => Number.isInteger(pid) && pid > 0))
+
+/** The table with one held slot changed by `patch`: an undefined field is dropped when the table is written. */
+export function withHolder(all: Locks, resource: string, slot: Slot, patch: Partial<Holder>): Locks {
+  const lock = all[resource]
+  if (!lock) return all
+  return { ...all, [resource]: { ...lock, holders: lock.holders.map(h => (isSame(h, slot) ? { ...h, ...patch } : h)) } }
+}
+
+/** The slots of `session` granted while it could not be told: its own sweep sends their GRANTED. */
+export const untoldOf = (all: Locks, session: string): { resource: string; holder: Holder }[] =>
+  Object.entries(all).flatMap(([resource, lock]) => lock.holders.filter(h => h.untold && h.session === session).map(holder => ({ resource, holder })))
 
 const DEVICE_SCRIPT = String.raw`(?:scripts/device|\$D|\bdevice)\s+up\s+`
 
@@ -242,7 +264,7 @@ const matchOf = (sources: readonly string[] | undefined, command: string): strin
  * From a subagent loop, `lineage` names that loop and the loops above it: a slot another worker of the same session
  * took is not this one's, while one its own worker or the main loop took is.
  */
-export function guardVerdictOf(all: Locks, command: string, session: string, tool: string, lineage?: readonly string[]): string | null {
+export function guardVerdictOf(all: Locks, command: string, session: string, tool: string, lineage?: readonly string[], isWokenByGrant = true): string | null {
   const isOwn = (h: Holder) => h.session === session && (lineage === undefined || h.agent === undefined || lineage.includes(h.agent))
   for (const [resource, lock] of Object.entries(all)) {
     const guard = lock.guard ?? KNOWN_GUARDS[resource]
@@ -251,8 +273,9 @@ export function guardVerdictOf(all: Locks, command: string, session: string, too
     const needed = matchOf(guard?.needs, command)
     if (needed && !lock.holders.some(isOwn)) {
       const waiting = lock.queue.some(isOwn)
+      const wait = isWokenByGrant ? `End the turn on "Waiting on ${resource}": a GRANTED message wakes you.` : `Call acquire again through ${tool}: it waits for the slot.`
       return waiting
-        ? `machine-locks: "${needed}" needs a ${resource} slot and this session is still queued for one. End the turn on "Waiting on ${resource}": a GRANTED message wakes you.`
+        ? `machine-locks: "${needed}" needs a ${resource} slot and this session is still queued for one. ${wait}`
         : `machine-locks: "${needed}" needs a ${resource} slot. Take one first through ${tool} (action acquire, resource ${resource}, your task as label), then run it again.`
     }
   }
