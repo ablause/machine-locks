@@ -1,11 +1,11 @@
 # machine-locks
 
-A Claude Code mod that queues sessions for the exclusive resources of one machine: an iOS simulator, an
-Android emulator, a local database, a fixed port, build capacity. When two worktrees, two background agents
-or two sessions started by hand want the same resource, one of them waits in line instead of colliding with
-the other.
+Queues coding-agent sessions for the exclusive resources of one machine: an iOS simulator, an Android
+emulator, a local database, a fixed port, build capacity. When two worktrees, two background agents or two
+sessions started by hand want the same resource, one of them waits in line instead of colliding with the
+other. Claude Code sessions and [Codex](#codex) sessions share the same line.
 
-What it adds to every session that loads it:
+What it adds to every Claude Code session that loads the mod:
 
 - one tool, `mcp__machine-locks__locks`, to define, acquire and release a resource;
 - a wake-up: a queued session ends its turn, and the session that frees the slot sends it `GRANTED <resource>`
@@ -21,7 +21,9 @@ What it adds to every session that loads it:
 
 ## Requirements
 
-- Claude Code 2.1.326 or later, which provides the mods API (`$.tool`, `$.session.send`, `$.store`, bands).
+- Claude Code 2.1.326 or later, which provides the mods API (`$.tool`, `$.session.send`, `$.fs`, bands).
+- For Codex: Codex CLI with hooks (0.124 or later) and Node.js 22.18 or later, which runs the TypeScript
+  sources as they are.
 - macOS or Linux. Memory and load come from `sysctl` and `memory_pressure` on macOS, and from `/proc` and
   `nproc` on Linux. Without either, plain capacity counts still work and budgeted resources are not granted
   from the machine's free memory.
@@ -81,12 +83,50 @@ session that has held a slot for 45 minutes is asked, once per hold, whether it 
 guard reads the command text: it stops a slip, not a script that boots a device on its own, and a guard
 that fails lets the command run.
 
+## Codex
+
+Codex loads the same lock engine as an MCP server, and the same Bash guards as a `PreToolUse` hook. Both read
+and write the table the mod uses, so a Codex session and a Claude Code session queue for one simulator
+together. From a clone of this repository, add to `~/.codex/config.toml`:
+
+```toml
+[mcp_servers.machine-locks]
+command = "node"
+args = ["/path/to/machine-locks/codex/server.mjs"]
+# An acquire waits for its slot inside the call: give it longer than MACHINE_LOCKS_WAIT_SEC (1500 by default).
+tool_timeout_sec = 1800
+default_tools_approval_mode = "approve"
+
+[[hooks.PreToolUse]]
+matcher = "^Bash$"
+
+[[hooks.PreToolUse.hooks]]
+type = "command"
+command = "node /path/to/machine-locks/codex/guard.mjs"
+```
+
+Codex runs a hook only once you have trusted it: review and trust this one in Codex after adding it.
+
+Codex cannot be woken by a message, so it works differently from the mod in three ways:
+
+- `acquire` holds the call until the slot is granted, sending progress notifications meanwhile. Past
+  `MACHINE_LOCKS_WAIT_SEC` it answers still queued, the place in line kept, and the same call goes on waiting.
+- Codex hands its MCP servers no session id, so a Codex session is known by its `codex` process, which the
+  server and the hook both find among their parents. A holder is alive while that process runs. One Codex
+  process that hosts several conversations at once (the desktop app) counts as one session.
+- There is no band, and no reminder after a long hold.
+
+A Claude Code session granted a slot by a Codex release is not messaged at once: its own sweep, every thirty
+seconds, sends it the `GRANTED`.
+
 ## How it works
 
-The table lives in the mod store that every session on the machine shares. `$.store` has no compare-and-set
-across processes, so every change holds `/tmp/claude-machine-locks.mutex`, created by `mkdir`; one left by a
-session killed mid-change is taken over after ten seconds. The pure logic (queue, budget, guards, history)
-is in `hooks/table.ts`; `hooks/register.tsx` wires it to the tool, the hooks and the band.
+The table and the history of released slots live in `~/.local/state/machine-locks` (`MACHINE_LOCKS_DIR`
+overrides it), written whole through a rename, so every Claude Code and Codex session on the machine reads the
+same one. Every change holds `/tmp/claude-machine-locks.mutex`, created by `mkdir`; one left by a session killed
+mid-change is taken over after ten seconds. The pure logic (queue, budget, guards, history) is in
+`hooks/table.ts`, the lock engine that runs it against a host in `hooks/engine.ts`; `hooks/register.tsx` wires
+it to Claude Code's tool, hooks and band, and `codex/` to Codex.
 
 Other mods can read and change the table through `$.machineLocks` (`list`, `release`, `releaseSession`),
 typed by `types/index.d.ts`, for instance to draw the locks on a board or to free a task's slots when its
