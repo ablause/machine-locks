@@ -23,8 +23,14 @@ type FileIo = {
   read: (path: string) => Promise<unknown>
   write: (path: string, text: string) => Promise<void>
   run: Ops['run']
-  env: () => Promise<Record<string, string>>
   tag: () => Promise<string>
+}
+
+/** The variables that place the table, as the Claude Code process has them: `$.process.hookEnv` holds only the session's, while `run` inherits the process's. */
+async function tableEnvOf(run: Ops['run']): Promise<Record<string, string>> {
+  const out = await run(['/bin/sh', '-c', 'printf "%s\\n%s" "${MACHINE_LOCKS_DIR-}" "${HOME-}"'], 2000)
+  const [dir = '', home = ''] = out.stdout.split('\n')
+  return { MACHINE_LOCKS_DIR: dir, HOME: home }
 }
 
 /**
@@ -33,7 +39,7 @@ type FileIo = {
  */
 function sharedFilesOf(io: FileIo): Pick<Ops, 'readShared' | 'writeShared'> {
   let dir: string | null = null
-  const dirOf = async () => (dir ??= sharedDirOf(await io.env()))
+  const dirOf = async () => (dir ??= sharedDirOf(await tableEnvOf(io.run)))
   return {
     readShared: async name => {
       const file = `${await dirOf()}/${name}.json`
@@ -71,7 +77,7 @@ const opsOf = ($: EngineInterface): Ops => {
   return {
     get: key => $.store.get(key),
     set: (key, value) => $.store.set(key, value),
-    ...sharedFilesOf({ exists: file => $.fs.exists(file), read: file => $.fs.read(file), write: (file, text) => $.fs.write(file, text), run, env: () => $.process.hookEnv(), tag: () => $.session.id() }),
+    ...sharedFilesOf({ exists: file => $.fs.exists(file), read: file => $.fs.read(file), write: (file, text) => $.fs.write(file, text), run, tag: () => $.session.id() }),
     now: () => $.clock.now(),
     sleep: ms => $.clock.sleep(ms),
     id: () => $.session.id(),
@@ -188,7 +194,7 @@ export const register: Register = on => {
     const ops: Ops = {
       get: key => built.store.get(key),
       set: (key, value) => built.store.set(key, value),
-      ...sharedFilesOf({ exists: file => built.fs.exists(file), read: file => built.fs.read(file), write: (file, text) => built.fs.write(file, text), run, env: () => built.process.hookEnv(), tag: () => built.session.id() }),
+      ...sharedFilesOf({ exists: file => built.fs.exists(file), read: file => built.fs.read(file), write: (file, text) => built.fs.write(file, text), run, tag: () => built.session.id() }),
       now: () => built.clock.now(),
       sleep: ms => built.clock.sleep(ms),
       id: () => built.session.id(),

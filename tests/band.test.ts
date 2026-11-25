@@ -56,7 +56,6 @@ test('the band draws above the prompt and its button frees the slot', async ($, 
     files.set(e.path, e.text)
     return { value: undefined }
   })
-  on('process.hookEnv', () => ({ value: { HOME: '/h' } }))
   on('clock.now', () => ({ value: 1_000_000 }))
   on('session.id', () => ({ value: 'a' }))
   on('session.cwd', () => ({ value: '/w/a' }))
@@ -68,7 +67,7 @@ test('the band draws above the prompt and its button frees the slot', async ($, 
       files.set(e.argv[3] ?? '', files.get(e.argv[2] ?? '') ?? '')
       files.delete(e.argv[2] ?? '')
     }
-    return { value: { exitCode: e.argv[0] === 'claude' ? 1 : 0, stdout: '', stderr: '', isStdoutTruncated: false, isStderrTruncated: false } }
+    return { value: { exitCode: e.argv[0] === 'claude' ? 1 : 0, stdout: e.argv[0] === '/bin/sh' ? '\n/h' : '', stderr: '', isStdoutTruncated: false, isStderrTruncated: false } }
   })
   await $.session.start({ cwd: '/w/a', surface: null, isInteractive: false })
   await $.tool.call({ tool: TOOL, action: 'define', resource: 'db', capacity: 1 } as never)

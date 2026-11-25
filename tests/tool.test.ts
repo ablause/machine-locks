@@ -35,7 +35,6 @@ function machine(on: On, live: string[] = ['a', 'b', 'c'], sysctl?: { stdout: st
     files.set(e.path, e.text)
     return { value: undefined }
   })
-  on('process.hookEnv', () => ({ value: { HOME: '/h' } }))
   const clock = mock.clock(on, { now: 1_000_000 })
   let me = 'a'
   on('session.id', () => ({ value: me }))
@@ -71,6 +70,7 @@ function machine(on: On, live: string[] = ['a', 'b', 'c'], sysctl?: { stdout: st
       delete mutex.madeAt
       return done(0)
     }
+    if (e.argv[0] === '/bin/sh') return done(0, '\n/h')
     if (e.argv[0] === 'mv') {
       const [, , from = '', to = ''] = e.argv
       const text = files.get(from)
