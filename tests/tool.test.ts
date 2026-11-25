@@ -19,6 +19,23 @@ function machine(on: On, live: string[] = ['a', 'b', 'c'], sysctl?: { stdout: st
     store.set(e.key, e.value)
     return { value: undefined }
   })
+  // The table's files, as `$.fs` and `mv` see them.
+  const files = new Map<string, string>()
+  on('fs.exists', (_$, e) => ({ value: files.has(e.path) }))
+  on('fs.read', (_$, e) => {
+    if (outage.reads > 0) {
+      outage.reads--
+      throw new Error('disk unavailable')
+    }
+    const text = files.get(e.path)
+    if (text === undefined) throw new Error(`ENOENT ${e.path}`)
+    return { value: text }
+  })
+  on('fs.write', (_$, e) => {
+    files.set(e.path, e.text)
+    return { value: undefined }
+  })
+  on('process.hookEnv', () => ({ value: { HOME: '/h' } }))
   const clock = mock.clock(on, { now: 1_000_000 })
   let me = 'a'
   on('session.id', () => ({ value: me }))
@@ -54,11 +71,25 @@ function machine(on: On, live: string[] = ['a', 'b', 'c'], sysctl?: { stdout: st
       delete mutex.madeAt
       return done(0)
     }
+    if (e.argv[0] === 'mv') {
+      const [, , from = '', to = ''] = e.argv
+      const text = files.get(from)
+      if (text === undefined) return done(1)
+      files.set(to, text)
+      files.delete(from)
+      return done(0)
+    }
     if (e.argv[0] === 'stat') return mutex.madeAt === undefined ? done(1) : done(0, `${mutex.madeAt}\n`)
     const rows = live.map(s => ({ sessionId: s, name: `session-${s}`, state: 'working' }))
     return done(0, e.argv[0] === 'claude' ? JSON.stringify(rows) : e.argv[0] === 'sysctl' ? (sysctl?.stdout ?? '') : (sysctl?.pressure ?? ''))
   })
-  return { store, clock, sent, prompts, unreachable, mutex, runs, outage, as: (session: string) => void (me = session) }
+  const LOCKS_FILE = '/h/.local/state/machine-locks/locks.json'
+  const table = () => {
+    const text = files.get(LOCKS_FILE)
+    return text === undefined ? undefined : JSON.parse(text)
+  }
+  const setTable = (locks: unknown) => void files.set(LOCKS_FILE, JSON.stringify(locks))
+  return { store, table, setTable, clock, sent, prompts, unreachable, mutex, runs, outage, as: (session: string) => void (me = session) }
 }
 
 const call = async ($: Engine, input: Record<string, unknown>) =>
@@ -102,7 +133,7 @@ test('a GRANTED that reaches nobody passes the slot to the next in line', async 
   m.unreachable.add('"b"')
   m.as('a')
   expect(await call($, { action: 'release', resource: 'simulator' })).toBe('simulator released, granted to session-c')
-  const table = m.store.get('locks') as Record<string, { holders: { session: string }[]; queue: unknown[] }>
+  const table = m.table() as Record<string, { holders: { session: string }[]; queue: unknown[] }>
   expect(table.simulator?.holders.map(h => h.session)).toEqual(['c'])
   expect(table.simulator?.queue).toEqual([])
 })
@@ -118,7 +149,7 @@ test('another live session keeps its slot; a gone one can be freed by name', asy
   m.as('c')
   await call($, { action: 'acquire', resource: 'db' })
   m.as('a')
-  m.store.set('locks', { db: { capacity: 1, holders: [{ session: 'gone', name: 'old' }], queue: [] } })
+  m.setTable({ db: { capacity: 1, holders: [{ session: 'gone', name: 'old' }], queue: [] } })
   expect(await call($, { action: 'release', resource: 'db', holder: 'old' })).toBe('db released')
 })
 
@@ -140,7 +171,7 @@ test('a paused background session keeps its slots', async ($, on) => {
   await call($, { action: 'define', resource: 'simulator', capacity: 1 })
   await call($, { action: 'acquire', resource: 'simulator' })
   await $.session.end({ reason: 'other', sessionId: 'a' } as never)
-  const table = m.store.get('locks') as Record<string, { holders: unknown[] }>
+  const table = m.table() as Record<string, { holders: unknown[] }>
   expect(table.simulator?.holders).toHaveLength(1)
 })
 
@@ -197,7 +228,7 @@ test('a change waits while another session holds the mutex', async ($, on) => {
   m.mutex.madeAt = Math.floor(m.clock.now() / 1000)
   const defined = call($, { action: 'define', resource: 'simulator', capacity: 1 })
   await m.clock.advance(100)
-  expect(m.store.get('locks')).toBeUndefined()
+  expect(m.table()).toBeUndefined()
   delete m.mutex.madeAt
   await m.clock.advance(100)
   expect(await defined).toBe('simulator defined, capacity 1')
