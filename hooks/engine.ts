@@ -63,8 +63,12 @@ export type Ops = {
   agent?: string
 }
 
-/** Where every host on the machine keeps the table, unless MACHINE_LOCKS_DIR says otherwise. */
-export const sharedDirOf = (env: Record<string, string | undefined>) => env.MACHINE_LOCKS_DIR || `${env.HOME ?? '/tmp'}/.local/state/machine-locks`
+/** Where every host on the machine keeps the table, unless MACHINE_LOCKS_DIR says otherwise: under the user's home, never a folder other users can write. */
+export function sharedDirOf(env: Record<string, string | undefined>): string {
+  if (env.MACHINE_LOCKS_DIR) return env.MACHINE_LOCKS_DIR
+  if (!env.HOME) throw new Error('machine-locks: neither MACHINE_LOCKS_DIR nor HOME is set, so the table has no folder')
+  return `${env.HOME}/.local/state/machine-locks`
+}
 
 /** A `mkdir` either creates the folder or fails, atomically: the claim every session of the machine takes before changing the table. */
 export const MUTEX_DIR = '/tmp/claude-machine-locks.mutex'
